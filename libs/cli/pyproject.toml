@@ -62,7 +62,7 @@ dependencies = [
 vertexai = ["langchain-google-vertexai>=3.0.0,<4.0.0"]
 
 [project.scripts]
-deepagents = "deepagents_cli:cli_main"
+deepagents-custom = "deepagents_cli:cli_main"
 deepagents-cli = "deepagents_cli:cli_main"
 
 [project.urls]

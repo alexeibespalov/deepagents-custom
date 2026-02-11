@@ -21,6 +21,47 @@ uv tool install deepagents-cli
 deepagents
 ```
 
+## Model providers
+
+The CLI supports selecting a model with `--model`. You can either let the CLI auto-detect the provider from the model name (e.g., `gpt-*`, `claude-*`, `gemini-*`), or specify it explicitly as `provider:model`.
+
+In the interactive UI, run `/model` to see which providers are configured from your environment.
+
+### Ollama (local)
+
+Uses Ollama's OpenAI-compatible server.
+
+```bash
+export OLLAMA_BASE_URL="http://localhost:11434/v1"
+export OLLAMA_MODEL="llama3"
+
+deepagents --model ollama:llama3
+```
+
+### LM Studio (local)
+
+Uses LM Studio's OpenAI-compatible server.
+
+```bash
+export LMSTUDIO_BASE_URL="http://localhost:1234/v1"
+export LMSTUDIO_MODEL="your-model"
+
+deepagents --model lmstudio:your-model
+```
+
+### Azure OpenAI (custom domain supported)
+
+Provide a full endpoint URL (including custom domains) and your deployment name.
+
+```bash
+export AZURE_OPENAI_ENDPOINT="https://ai.mycorp.com/"
+export AZURE_OPENAI_API_KEY="..."
+export AZURE_OPENAI_API_VERSION="2024-10-21"
+export AZURE_OPENAI_DEPLOYMENT="my-deployment"
+
+deepagents --model azure:my-deployment
+```
+
 ## 🤔 What is this?
 
 Using an LLM to call tools in a loop is the simplest form of an agent. This architecture, however, can yield agents that are "shallow" and fail to plan and act over longer, more complex tasks.

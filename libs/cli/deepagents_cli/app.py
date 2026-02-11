@@ -28,6 +28,7 @@ from deepagents_cli.config import (
     SHELL_TOOL_NAMES,
     CharsetMode,
     _detect_charset_mode,
+    get_configured_model_specs,
     is_shell_command_allowed,
     settings,
 )
@@ -969,13 +970,13 @@ class DeepAgentsApp(App):
         elif cmd == "/help":
             await self._mount_message(UserMessage(command))
             help_text = (
-                "Commands: /quit, /clear, /remember, /tokens, /threads, /help\n\n"
+                "Commands: /quit, /clear, /model, /remember, /tokens, /threads, /help\n\n"
                 "Interactive Features:\n"
                 "  Enter           Submit your message\n"
                 "  Ctrl+J          Insert newline\n"
                 "  Shift+Tab       Toggle auto-approve mode\n"
                 "  @filename       Auto-complete files and inject content\n"
-                "  /command        Slash commands (/help, /clear, /quit)\n"
+                "  /command        Slash commands (/help, /model, /clear, /quit)\n"
                 "  !command        Run bash commands directly\n\n"
                 "Docs: https://docs.langchain.com/oss/python/deepagents/cli"
             )
@@ -1032,6 +1033,52 @@ class DeepAgentsApp(App):
                 )
             else:
                 await self._mount_message(AppMessage("No token usage yet"))
+        elif cmd == "/model":
+            await self._mount_message(UserMessage(command))
+
+            runnable_specs = get_configured_model_specs(settings)
+            current = settings.model_name or "(not set)"
+            provider = settings.model_provider or "(unknown)"
+
+            lines: list[str] = [
+                f"Current: {current}",
+                f"Provider: {provider}",
+                "",
+            ]
+
+            if runnable_specs:
+                lines.append("Configured selections (restart with one of these):")
+                for spec in runnable_specs:
+                    lines.append(f"  - {spec}")
+            else:
+                lines.append("No runnable model selections detected from environment.")
+
+            lines.extend(
+                [
+                    "",
+                    "Examples:",
+                    "  deepagents --model ollama:llama3",
+                    "  deepagents --model lmstudio:your-model",
+                    "  deepagents --model azure:your-deployment",
+                    "",
+                    "Required env vars:",
+                    "  - Ollama:   OLLAMA_BASE_URL (and optionally OLLAMA_MODEL)",
+                    "  - LM Studio: LMSTUDIO_BASE_URL (and optionally LMSTUDIO_MODEL)",
+                    "  - Azure:    AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, AZURE_OPENAI_API_VERSION (and optionally AZURE_OPENAI_DEPLOYMENT)",
+                ]
+            )
+
+            if self._session_state:
+                thread_id = self._session_state.thread_id
+                lines.extend(
+                    [
+                        "",
+                        "Tip:",
+                        f"  To continue this thread with a different model: deepagents --resume {thread_id} --model <provider:model>",
+                    ]
+                )
+
+            await self._mount_message(AppMessage("\n".join(lines)))
         elif cmd == "/remember" or cmd.startswith("/remember "):
             # Extract any additional context after /remember
             additional_context = ""

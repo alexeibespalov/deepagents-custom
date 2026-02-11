@@ -7,6 +7,7 @@ import re
 import shlex
 import sys
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from importlib.metadata import PackageNotFoundError, distribution
@@ -19,7 +20,28 @@ from deepagents_cli._version import __version__
 
 logger = logging.getLogger(__name__)
 
-dotenv.load_dotenv()
+def _load_dotenv_from_cwd() -> None:
+    """Load environment variables from a `.env` file.
+
+    We intentionally search from the *current working directory* so that running the
+    installed CLI inside a project folder picks up that project's `.env`.
+    """
+
+    dotenv_path = dotenv.find_dotenv(usecwd=True)
+    if dotenv_path:
+        dotenv_values = dotenv.dotenv_values(dotenv_path)
+        for key, value in dotenv_values.items():
+            if value is None:
+                continue
+
+            existing_value = os.environ.get(key)
+            if existing_value in {None, ""}:
+                os.environ[key] = value
+    else:
+        dotenv.load_dotenv()
+
+
+_load_dotenv_from_cwd()
 
 # CRITICAL: Override LANGSMITH_PROJECT to route agent traces to separate project
 # LangSmith reads LANGSMITH_PROJECT at invocation time, so we override it here
@@ -421,6 +443,18 @@ class Settings:
     google_api_key: str | None
     tavily_api_key: str | None
 
+    # Azure OpenAI configuration
+    azure_openai_api_key: str | None
+    azure_openai_endpoint: str | None
+    azure_openai_api_version: str | None
+    azure_openai_deployment: str | None
+
+    # Local OpenAI-compatible providers
+    ollama_base_url: str | None
+    ollama_model: str | None
+    lmstudio_base_url: str | None
+    lmstudio_model: str | None
+
     # Google Cloud configuration (for VertexAI)
     google_cloud_project: str | None
 
@@ -456,6 +490,18 @@ class Settings:
         tavily_key = os.environ.get("TAVILY_API_KEY")
         google_cloud_project = os.environ.get("GOOGLE_CLOUD_PROJECT")
 
+        azure_openai_api_key = os.environ.get("AZURE_OPENAI_API_KEY")
+        azure_openai_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
+        azure_openai_api_version = os.environ.get("AZURE_OPENAI_API_VERSION")
+        azure_openai_deployment = os.environ.get("AZURE_OPENAI_DEPLOYMENT") or os.environ.get(
+            "AZURE_OPENAI_API_DEPLOYMENT_NAME"
+        )
+
+        ollama_base_url = os.environ.get("OLLAMA_BASE_URL")
+        ollama_model = os.environ.get("OLLAMA_MODEL")
+        lmstudio_base_url = os.environ.get("LMSTUDIO_BASE_URL")
+        lmstudio_model = os.environ.get("LMSTUDIO_MODEL")
+
         # Detect LangSmith configuration
         # DEEPAGENTS_LANGSMITH_PROJECT: Project for deepagents agent tracing
         # user_langchain_project: User's ORIGINAL LANGSMITH_PROJECT (before override)
@@ -478,6 +524,14 @@ class Settings:
             anthropic_api_key=anthropic_key,
             google_api_key=google_key,
             tavily_api_key=tavily_key,
+            azure_openai_api_key=azure_openai_api_key,
+            azure_openai_endpoint=azure_openai_endpoint,
+            azure_openai_api_version=azure_openai_api_version,
+            azure_openai_deployment=azure_openai_deployment,
+            ollama_base_url=ollama_base_url,
+            ollama_model=ollama_model,
+            lmstudio_base_url=lmstudio_base_url,
+            lmstudio_model=lmstudio_model,
             google_cloud_project=google_cloud_project,
             deepagents_langchain_project=deepagents_langchain_project,
             user_langchain_project=user_langchain_project,
@@ -499,6 +553,25 @@ class Settings:
     def has_google(self) -> bool:
         """Check if Google API key is configured."""
         return self.google_api_key is not None
+
+    @property
+    def has_azure_openai(self) -> bool:
+        """Check if Azure OpenAI is configured via environment variables."""
+        return (
+            self.azure_openai_api_key is not None
+            and self.azure_openai_endpoint is not None
+            and self.azure_openai_api_version is not None
+        )
+
+    @property
+    def has_ollama(self) -> bool:
+        """Check if an Ollama OpenAI-compatible endpoint is configured."""
+        return self.ollama_base_url is not None
+
+    @property
+    def has_lmstudio(self) -> bool:
+        """Check if an LM Studio OpenAI-compatible endpoint is configured."""
+        return self.lmstudio_base_url is not None
 
     @property
     def has_vertex_ai(self) -> bool:
@@ -1050,6 +1123,107 @@ def _detect_provider(model_name: str) -> str | None:
     return None
 
 
+_KNOWN_PROVIDER_PREFIXES: frozenset[str] = frozenset(
+    {
+        "openai",
+        "anthropic",
+        "google",
+        "vertexai",
+        "azure",
+        "ollama",
+        "lmstudio",
+    }
+)
+
+_PROVIDER_PREFIX_ALIASES: dict[str, str] = {
+    "azure-openai": "azure",
+    "azure_openai": "azure",
+    "lm-studio": "lmstudio",
+    "lm_studio": "lmstudio",
+}
+
+
+def _parse_model_spec(model_spec: str) -> tuple[str | None, str]:
+    """Parse a model spec of the form `provider:model`.
+
+    If the prefix isn't recognized, returns `(None, model_spec)`.
+
+    Args:
+        model_spec: Model string passed via `--model`.
+
+    Returns:
+        Tuple of `(provider_or_none, model_name)`.
+
+    Raises:
+        SystemExit: If a recognized provider prefix is provided with an empty model.
+    """
+    if ":" not in model_spec:
+        return None, model_spec
+
+    raw_prefix, raw_model = model_spec.split(":", 1)
+    prefix = raw_prefix.strip().lower()
+    provider = _PROVIDER_PREFIX_ALIASES.get(prefix, prefix)
+    if provider not in _KNOWN_PROVIDER_PREFIXES:
+        return None, model_spec
+
+    model_name = raw_model.strip()
+    if not model_name:
+        console.print(
+            "[bold red]Error:[/bold red] Empty model name after provider prefix: "
+            f"{raw_prefix!r}"
+        )
+        console.print("Example: --model ollama:llama3")
+        sys.exit(1)
+
+    return provider, model_name
+
+
+def get_configured_model_specs(
+    settings_obj: Settings, *, env: Mapping[str, str] | None = None
+) -> list[str]:
+    """Return runnable `--model` specs for providers configured in env.
+
+    This is used by the `/model` slash command to list only options that are
+    runnable without requiring additional input.
+
+    Args:
+        settings_obj: Settings object to inspect.
+        env: Optional environment mapping (defaults to `os.environ`).
+
+    Returns:
+        List of strings such as `openai:gpt-5.2`, `ollama:llama3`, `azure:my-deployment`.
+    """
+    environ = os.environ if env is None else env
+    specs: list[str] = []
+
+    if settings_obj.has_openai:
+        specs.append(f"openai:{environ.get('OPENAI_MODEL', 'gpt-5.2')}")
+
+    if settings_obj.has_azure_openai and settings_obj.azure_openai_deployment:
+        specs.append(f"azure:{settings_obj.azure_openai_deployment}")
+
+    if settings_obj.has_anthropic:
+        specs.append(
+            f"anthropic:{environ.get('ANTHROPIC_MODEL', 'claude-sonnet-4-5-20250929')}"
+        )
+
+    if settings_obj.has_google:
+        specs.append(f"google:{environ.get('GOOGLE_MODEL', 'gemini-3-pro-preview')}")
+
+    if settings_obj.has_vertex_ai:
+        specs.append(
+            f"vertexai:{environ.get('VERTEX_AI_MODEL', 'gemini-3-pro-preview')}"
+        )
+
+    if settings_obj.has_ollama and settings_obj.ollama_model:
+        specs.append(f"ollama:{settings_obj.ollama_model}")
+
+    if settings_obj.has_lmstudio and settings_obj.lmstudio_model:
+        specs.append(f"lmstudio:{settings_obj.lmstudio_model}")
+
+    return specs
+
+
 def create_model(model_name_override: str | None = None) -> BaseChatModel:
     """Create the appropriate model based on available API keys.
 
@@ -1066,8 +1240,10 @@ def create_model(model_name_override: str | None = None) -> BaseChatModel:
     """
     # Determine provider and model
     if model_name_override:
-        # Use provided model, auto-detect provider
-        provider = _detect_provider(model_name_override)
+        provider_from_prefix, parsed_model_name = _parse_model_spec(model_name_override)
+
+        # Use provider prefix if present, otherwise auto-detect from model name.
+        provider = provider_from_prefix or _detect_provider(model_name_override)
         if not provider:
             console.print(
                 "[bold red]Error:[/bold red] Could not detect provider "
@@ -1081,6 +1257,11 @@ def create_model(model_name_override: str | None = None) -> BaseChatModel:
                 "  - VertexAI: claude-*/gemini-* (requires GOOGLE_CLOUD_PROJECT, "
                 "uses Application Default Credentials)"
             )
+            console.print("\nOr use an explicit provider prefix:")
+            console.print("  --model openai:<model>")
+            console.print("  --model azure:<deployment>")
+            console.print("  --model ollama:<model>")
+            console.print("  --model lmstudio:<model>")
             sys.exit(1)
 
         # Check if credentials for detected provider are available
@@ -1088,6 +1269,12 @@ def create_model(model_name_override: str | None = None) -> BaseChatModel:
             console.print(
                 f"[bold red]Error:[/bold red] Model '{model_name_override}' "
                 "requires OPENAI_API_KEY"
+            )
+            sys.exit(1)
+        elif provider == "azure" and not settings.has_azure_openai:
+            console.print(
+                f"[bold red]Error:[/bold red] Model '{model_name_override}' requires "
+                "AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, and AZURE_OPENAI_API_VERSION"
             )
             sys.exit(1)
         elif provider == "anthropic" and not settings.has_anthropic:
@@ -1112,11 +1299,42 @@ def create_model(model_name_override: str | None = None) -> BaseChatModel:
             console.print("  gcloud auth application-default login")
             sys.exit(1)
 
-        model_name = model_name_override
+        if provider == "ollama" and not settings.has_ollama:
+            console.print(
+                f"[bold red]Error:[/bold red] Model '{model_name_override}' requires "
+                "OLLAMA_BASE_URL to be set"
+            )
+            sys.exit(1)
+
+        if provider == "lmstudio" and not settings.has_lmstudio:
+            console.print(
+                f"[bold red]Error:[/bold red] Model '{model_name_override}' requires "
+                "LMSTUDIO_BASE_URL to be set"
+            )
+            sys.exit(1)
+
+        model_name = parsed_model_name
     # Use environment variable defaults, detect provider by API key priority
     elif settings.has_openai:
         provider = "openai"
         model_name = os.environ.get("OPENAI_MODEL", "gpt-5.2")
+    elif settings.has_azure_openai:
+        provider = "azure"
+        model_name = settings.azure_openai_deployment or os.environ.get(
+            "AZURE_OPENAI_DEPLOYMENT"
+        ) or os.environ.get(
+            "AZURE_OPENAI_API_DEPLOYMENT_NAME"
+        )
+        if not model_name:
+            console.print(
+                "[bold red]Error:[/bold red] Azure OpenAI is configured but no "
+                "deployment name was provided."
+            )
+            console.print(
+                "\nSet AZURE_OPENAI_DEPLOYMENT (or AZURE_OPENAI_API_DEPLOYMENT_NAME) "
+                "or pass --model azure:<deployment>."
+            )
+            sys.exit(1)
     elif settings.has_anthropic:
         provider = "anthropic"
         model_name = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5-20250929")
@@ -1126,23 +1344,50 @@ def create_model(model_name_override: str | None = None) -> BaseChatModel:
     elif settings.has_vertex_ai:
         provider = "vertexai"
         model_name = os.environ.get("VERTEX_AI_MODEL", "gemini-3-pro-preview")
+    elif settings.has_ollama:
+        provider = "ollama"
+        model_name = settings.ollama_model
+        if not model_name:
+            console.print(
+                "[bold red]Error:[/bold red] OLLAMA_BASE_URL is set but no model was configured."
+            )
+            console.print("\nSet OLLAMA_MODEL or pass --model ollama:<model>.")
+            sys.exit(1)
+    elif settings.has_lmstudio:
+        provider = "lmstudio"
+        model_name = settings.lmstudio_model
+        if not model_name:
+            console.print(
+                "[bold red]Error:[/bold red] LMSTUDIO_BASE_URL is set but no model was configured."
+            )
+            console.print("\nSet LMSTUDIO_MODEL or pass --model lmstudio:<model>.")
+            sys.exit(1)
     else:
         console.print("[bold red]Error:[/bold red] No credentials configured.")
         console.print("\nPlease set one of the following environment variables:")
         console.print("  - OPENAI_API_KEY     (for OpenAI models like gpt-5.2)")
+        console.print(
+            "  - AZURE_OPENAI_API_KEY + AZURE_OPENAI_ENDPOINT + AZURE_OPENAI_API_VERSION "
+            "(for Azure OpenAI)"
+        )
         console.print("  - ANTHROPIC_API_KEY  (for Claude models)")
         console.print("  - GOOGLE_API_KEY     (for Google Gemini models)")
         console.print(
             "  - GOOGLE_CLOUD_PROJECT (for VertexAI models, "
             "with Application Default Credentials)"
         )
+        console.print("  - OLLAMA_BASE_URL    (for Ollama via OpenAI-compatible endpoint)")
+        console.print("  - LMSTUDIO_BASE_URL  (for LM Studio via OpenAI-compatible endpoint)")
         console.print("\nExample:")
         console.print("  export OPENAI_API_KEY=your_api_key_here")
         console.print("\nOr add it to your .env file.")
         sys.exit(1)
 
     # Store model info in settings for display
-    settings.model_name = model_name
+    if provider in {"azure", "ollama", "lmstudio"}:
+        settings.model_name = f"{provider}:{model_name}"
+    else:
+        settings.model_name = model_name
     settings.model_provider = provider
 
     # Create the model
@@ -1151,6 +1396,33 @@ def create_model(model_name_override: str | None = None) -> BaseChatModel:
         from langchain_openai import ChatOpenAI
 
         model = ChatOpenAI(model=model_name)  # type: ignore[call-arg]
+    elif provider == "ollama":
+        from langchain_openai import ChatOpenAI
+
+        # Ollama OpenAI-compatible server typically runs at http://localhost:11434/v1
+        model = ChatOpenAI(
+            model=model_name,
+            openai_api_base=settings.ollama_base_url,
+            openai_api_key="local",
+        )  # type: ignore[call-arg]
+    elif provider == "lmstudio":
+        from langchain_openai import ChatOpenAI
+
+        # LM Studio OpenAI-compatible server typically runs at http://localhost:1234/v1
+        model = ChatOpenAI(
+            model=model_name,
+            openai_api_base=settings.lmstudio_base_url,
+            openai_api_key="local",
+        )  # type: ignore[call-arg]
+    elif provider == "azure":
+        from langchain_openai import AzureChatOpenAI
+
+        model = AzureChatOpenAI(
+            azure_endpoint=settings.azure_openai_endpoint,
+            openai_api_version=settings.azure_openai_api_version,
+            deployment_name=model_name,
+            openai_api_key=settings.azure_openai_api_key,
+        )  # type: ignore[call-arg]
     elif provider == "anthropic":
         from langchain_anthropic import ChatAnthropic
 
