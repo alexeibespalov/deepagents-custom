@@ -65,6 +65,8 @@ from deepagents_cli.model_config import (  # noqa: E402
     ModelSpec,
 )
 
+DOCS_URL = "https://docs.langchain.com/oss/python/deepagents/cli"
+
 # Color scheme
 COLORS = {
     "primary": "#10b981",
@@ -180,6 +182,9 @@ _glyphs_cache: Glyphs | None = None
 
 # Module-level cache for editable install detection
 _editable_cache: bool | None = None
+
+# Module-level cache for LangSmith project URL (None means "not yet fetched")
+_langsmith_url_cache: tuple[str, str | None] | None = None
 
 
 def _is_editable_install() -> bool:
@@ -600,16 +605,6 @@ class Settings:
         return self.tavily_api_key is not None
 
     @property
-    def has_deepagents_langchain_project(self) -> bool:
-        """Check if deepagents LangChain project name is configured."""
-        return self.deepagents_langchain_project is not None
-
-    @property
-    def has_project(self) -> bool:
-        """Check if currently in a git project."""
-        return self.project_root is not None
-
-    @property
     def user_deepagents_dir(self) -> Path:
         """Get the base user-level .deepagents directory.
 
@@ -697,19 +692,6 @@ class Settings:
         agent_dir = self.get_agent_dir(agent_name)
         agent_dir.mkdir(parents=True, exist_ok=True)
         return agent_dir
-
-    def ensure_project_deepagents_dir(self) -> Path | None:
-        """Ensure the project .deepagents directory exists and return its path.
-
-        Returns:
-            Path to project .deepagents directory, or None if not in a project
-        """
-        if not self.project_root:
-            return None
-
-        project_deepagents_dir = self.project_root / ".deepagents"
-        project_deepagents_dir.mkdir(parents=True, exist_ok=True)
-        return project_deepagents_dir
 
     def get_user_skills_dir(self, agent_name: str) -> Path:
         """Get user-level skills directory path for a specific agent.
@@ -1067,8 +1049,11 @@ def get_langsmith_project_name() -> str | None:
 def fetch_langsmith_project_url(project_name: str) -> str | None:
     """Fetch the LangSmith project URL via the LangSmith client.
 
-    This is a blocking network call. In async contexts, run it in a thread
-    (e.g. via `asyncio.to_thread`).
+    Results are cached at module level so repeated calls do not make additional
+    network requests. Failed lookups are also cached to avoid retries.
+
+    This is a blocking network call on the first invocation. In async
+    contexts, run it in a thread (e.g. via `asyncio.to_thread`).
 
     Returns None (with a debug log) on any expected failure: missing
     `langsmith` package, network errors, invalid project names, or client
@@ -1080,6 +1065,14 @@ def fetch_langsmith_project_url(project_name: str) -> str | None:
     Returns:
         Project URL string if found, None otherwise.
     """
+    global _langsmith_url_cache  # noqa: PLW0603
+
+    if _langsmith_url_cache is not None:
+        cached_name, cached_url = _langsmith_url_cache
+        if cached_name == project_name:
+            return cached_url
+        # Different project name — fall through to fetch.
+
     try:
         from langsmith import Client
 
@@ -1090,9 +1083,42 @@ def fetch_langsmith_project_url(project_name: str) -> str | None:
             project_name,
             exc_info=True,
         )
+        _langsmith_url_cache = (project_name, None)
         return None
     else:
-        return project.url or None
+        url = project.url or None
+        _langsmith_url_cache = (project_name, url)
+        return url
+
+
+def build_langsmith_thread_url(thread_id: str) -> str | None:
+    """Build a full LangSmith thread URL if tracing is configured.
+
+    Combines `get_langsmith_project_name` and `fetch_langsmith_project_url`
+    into a single convenience helper.
+
+    Args:
+        thread_id: Thread identifier to build the URL for.
+
+    Returns:
+        Full thread URL string, or `None` if unavailable (LangSmith is not
+            configured or the project URL cannot be resolved.)
+    """
+    project_name = get_langsmith_project_name()
+    if not project_name:
+        return None
+
+    project_url = fetch_langsmith_project_url(project_name)
+    if not project_url:
+        return None
+
+    return f"{project_url.rstrip('/')}/t/{thread_id}"
+
+
+def reset_langsmith_url_cache() -> None:
+    """Reset the LangSmith URL cache (for testing)."""
+    global _langsmith_url_cache  # noqa: PLW0603
+    _langsmith_url_cache = None
 
 
 def get_default_coding_instructions() -> str:
@@ -1384,8 +1410,7 @@ class ModelResult:
         """Commit this result's metadata to global `settings`."""
         settings.model_name = self.model_name
         settings.model_provider = self.provider
-        if self.context_limit is not None:
-            settings.model_context_limit = self.context_limit
+        settings.model_context_limit = self.context_limit
 
 
 def create_model(

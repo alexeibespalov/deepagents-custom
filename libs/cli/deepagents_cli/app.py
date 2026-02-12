@@ -9,6 +9,7 @@ import os
 # S404: subprocess is required for user-initiated shell commands via ! prefix
 import subprocess  # noqa: S404
 import uuid
+import webbrowser
 from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from rich.text import Text
 from textual.app import App
 from textual.binding import Binding, BindingType
 from textual.containers import Container, VerticalScroll
@@ -26,9 +28,11 @@ from textual.widgets import Static
 from deepagents_cli.agent import create_cli_agent
 from deepagents_cli.clipboard import copy_selection_to_clipboard
 from deepagents_cli.config import (
+    DOCS_URL,
     SHELL_TOOL_NAMES,
     CharsetMode,
     _detect_charset_mode,
+    build_langsmith_thread_url,
     create_model,
     detect_provider,
     is_shell_command_allowed,
@@ -58,6 +62,7 @@ from deepagents_cli.widgets.messages import (
 )
 from deepagents_cli.widgets.model_selector import ModelSelectorScreen
 from deepagents_cli.widgets.status import StatusBar
+from deepagents_cli.widgets.thread_selector import ThreadSelectorScreen
 from deepagents_cli.widgets.welcome import WelcomeBanner
 
 logger = logging.getLogger(__name__)
@@ -219,6 +224,12 @@ class TextualSessionState:
         self.thread_id = uuid.uuid4().hex[:8]
         return self.thread_id
 
+
+_COMMAND_URLS: dict[str, str] = {
+    "/changelog": "https://github.com/langchain-ai/deepagents/blob/main/libs/cli/CHANGELOG.md",
+    "/docs": DOCS_URL,
+    "/feedback": "https://github.com/langchain-ai/deepagents/issues/new/choose",
+}
 
 # Prompt for /remember command - triggers agent to review conversation and update
 # memory/skills
@@ -819,13 +830,8 @@ class DeepAgentsApp(App):
                         )
                         await self._mount_before_queued(messages, auto_msg)
                     self._scroll_chat_to_bottom()
-                except NoMatches:
-                    # Cosmetic only: approval already granted via result_future.
-                    logger.warning(
-                        "Could not find #messages container to display "
-                        "auto-approval notification for commands: %s",
-                        approved_commands,
-                    )
+                except Exception:  # noqa: S110
+                    pass  # Don't fail if we can't show the message
 
                 return result_future
 
@@ -983,6 +989,89 @@ class DeepAgentsApp(App):
         except OSError as e:
             await self._mount_message(ErrorMessage(str(e)))
 
+    async def _open_url_command(self, command: str, cmd: str) -> None:
+        """Open a URL in the browser and display a clickable link.
+
+        Args:
+            command: The raw command text (displayed as user message).
+            cmd: The normalized slash command used to look up the URL.
+        """
+        url = _COMMAND_URLS[cmd]
+        await self._mount_message(UserMessage(command))
+        webbrowser.open(url)
+        link = Text(url, style="dim italic")
+        link.stylize(f"link {url}", 0)
+        await self._mount_message(AppMessage(link))
+
+    @staticmethod
+    async def _build_thread_message(prefix: str, thread_id: str) -> str | Text:
+        """Build a thread status message, hyperlinking the ID when possible.
+
+        Attempts to resolve the LangSmith thread URL with a short timeout.
+        Falls back to plain text if tracing is not configured or resolution
+        fails.
+
+        Args:
+            prefix: Label before the thread ID (e.g. `'Resumed thread'`).
+            thread_id: The thread identifier.
+
+        Returns:
+            A Rich `Text` with a clickable thread ID, or a plain string.
+        """
+        try:
+            url = await asyncio.wait_for(
+                asyncio.to_thread(build_langsmith_thread_url, thread_id),
+                timeout=2.0,
+            )
+        except (TimeoutError, Exception):
+            url = None
+
+        if url:
+            return Text.assemble(
+                f"{prefix}: ",
+                (thread_id, f"link {url}"),
+            )
+        return f"{prefix}: {thread_id}"
+
+    async def _handle_trace_command(self, command: str) -> None:
+        """Open the current thread in LangSmith.
+
+        Shows a hint if no conversation has been started yet or if LangSmith
+        tracing is not configured. Otherwise, opens the thread URL in the
+        default browser and displays a clickable link.
+
+        Args:
+            command: The raw command text (displayed as user message).
+        """
+        await self._mount_message(UserMessage(command))
+        if not self._session_state:
+            await self._mount_message(AppMessage("No active session."))
+            return
+        thread_id = self._session_state.thread_id
+        try:
+            url = await asyncio.to_thread(build_langsmith_thread_url, thread_id)
+        except Exception:
+            logger.exception("Failed to build LangSmith thread URL for %s", thread_id)
+            await self._mount_message(
+                AppMessage("Failed to resolve LangSmith thread URL.")
+            )
+            return
+        if not url:
+            await self._mount_message(
+                AppMessage(
+                    "LangSmith tracing is not configured. "
+                    "Set LANGSMITH_API_KEY and LANGSMITH_TRACING=true to enable."
+                )
+            )
+            return
+        try:
+            webbrowser.open(url)
+        except Exception:
+            logger.debug("Could not open browser for URL: %s", url, exc_info=True)
+        link = Text(url, style="dim italic")
+        link.stylize(f"link {url}", 0)
+        await self._mount_message(AppMessage(link))
+
     async def _handle_command(self, command: str) -> None:
         """Handle a slash command.
 
@@ -995,9 +1084,9 @@ class DeepAgentsApp(App):
             self.exit()
         elif cmd == "/help":
             await self._mount_message(UserMessage(command))
-            help_text = (
+            help_text = Text(
                 "Commands: /quit, /clear, /model [--default], /remember, "
-                "/tokens, /threads, /help\n\n"
+                "/tokens, /threads, /trace, /changelog, /docs, /feedback, /help\n\n"
                 "Interactive Features:\n"
                 "  Enter           Submit your message\n"
                 "  Ctrl+J          Insert newline\n"
@@ -1005,10 +1094,14 @@ class DeepAgentsApp(App):
                 "  @filename       Auto-complete files and inject content\n"
                 "  /command        Slash commands (/help, /model, /clear, /quit)\n"
                 "  !command        Run bash commands directly\n\n"
-                "Docs: https://docs.langchain.com/oss/python/deepagents/cli"
+                f"Docs: {DOCS_URL}",
+                style="dim italic",
             )
+            help_text.stylize(f"link {DOCS_URL}", help_text.plain.index(DOCS_URL))
             await self._mount_message(AppMessage(help_text))
 
+        elif cmd in {"/changelog", "/docs", "/feedback"}:
+            await self._open_url_command(command, cmd)
         elif cmd == "/version":
             await self._mount_message(UserMessage(command))
             # Show CLI package version
@@ -1040,13 +1133,9 @@ class DeepAgentsApp(App):
                     AppMessage(f"Started new thread: {new_thread_id}")
                 )
         elif cmd == "/threads":
-            await self._mount_message(UserMessage(command))
-            if self._session_state:
-                await self._mount_message(
-                    AppMessage(f"Current thread: {self._session_state.thread_id}")
-                )
-            else:
-                await self._mount_message(AppMessage("No active thread"))
+            await self._show_thread_selector()
+        elif cmd == "/trace":
+            await self._handle_trace_command(command)
         elif cmd == "/tokens":
             await self._mount_message(UserMessage(command))
             if self._token_tracker and self._token_tracker.current_context > 0:
@@ -1336,10 +1425,12 @@ class DeepAgentsApp(App):
                 if widget:
                     widget.set_rejected()  # Shows as interrupted/rejected in UI
 
-            # Show system message indicating this is a resumed thread
-            await self._mount_message(
-                AppMessage(f"Resumed thread: {self._lc_thread_id}")
+            # Show system message indicating this is a resumed thread,
+            # with a clickable LangSmith link when tracing is configured.
+            thread_msg = await self._build_thread_message(
+                "Resumed thread", self._lc_thread_id
             )
+            await self._mount_message(AppMessage(thread_msg))
 
             # Scroll to bottom after UI fully renders
             # Use set_timer to ensure layout is complete (Markdown rendering is async)
@@ -1464,8 +1555,10 @@ class DeepAgentsApp(App):
             messages = self.query_one("#messages", Container)
             await messages.remove_children()
         except NoMatches:
-            # Widget not found - can happen during shutdown
-            pass
+            logger.warning(
+                "Messages container (#messages) not found during clear; "
+                "UI may be out of sync with message store"
+            )
 
     def action_quit_or_interrupt(self) -> None:
         """Handle Ctrl+C - interrupt agent, reject approval, or quit on double press.
@@ -1661,6 +1754,106 @@ class DeepAgentsApp(App):
         )
         self.push_screen(screen, handle_result)
 
+    async def _show_thread_selector(self) -> None:
+        """Show interactive thread selector as a modal screen."""
+        current = self._session_state.thread_id if self._session_state else None
+
+        def handle_result(result: str | None) -> None:
+            """Handle the thread selector result."""
+            if result is not None:
+                self.call_later(self._resume_thread, result)
+            if self._chat_input:
+                self._chat_input.focus_input()
+
+        screen = ThreadSelectorScreen(current_thread=current)
+        self.push_screen(screen, handle_result)
+
+    async def _resume_thread(self, thread_id: str) -> None:
+        """Resume a previously saved thread.
+
+        Clears the current conversation, switches to the selected thread,
+        updates the welcome banner, and loads its message history.
+
+        Args:
+            thread_id: The thread ID to resume.
+        """
+        if not self._agent:
+            await self._mount_message(
+                AppMessage("Cannot switch threads: no active agent")
+            )
+            return
+
+        if not self._session_state:
+            await self._mount_message(
+                AppMessage("Cannot switch threads: no active session")
+            )
+            return
+
+        # Skip if already on this thread
+        if self._session_state.thread_id == thread_id:
+            await self._mount_message(AppMessage(f"Already on thread: {thread_id}"))
+            return
+
+        # Save previous state for rollback on failure
+        prev_thread_id = self._lc_thread_id
+        prev_session_thread = self._session_state.thread_id
+
+        try:
+            # Clear conversation (similar to /clear, without creating a new thread)
+            self._pending_messages.clear()
+            self._queued_widgets.clear()
+            await self._clear_messages()
+            if self._token_tracker:
+                self._token_tracker.reset()
+            self._update_status("")
+
+            # Switch to the selected thread
+            self._session_state.thread_id = thread_id
+            self._lc_thread_id = thread_id
+
+            # Update welcome banner
+            try:
+                banner = self.query_one("#welcome-banner", WelcomeBanner)
+                banner.update_thread_id(thread_id)
+            except NoMatches:
+                logger.debug(
+                    "Welcome banner not found during thread switch to %s",
+                    thread_id,
+                )
+
+            # Load thread history
+            await self._load_thread_history()
+
+        except Exception as exc:
+            logger.exception("Failed to switch to thread %s", thread_id)
+            # Restore previous thread IDs so the user can retry
+            self._session_state.thread_id = prev_session_thread
+            self._lc_thread_id = prev_thread_id
+            try:
+                banner = self.query_one("#welcome-banner", WelcomeBanner)
+                banner.update_thread_id(prev_session_thread)
+            except NoMatches:
+                logger.warning(
+                    "Welcome banner not found during rollback to thread %s; "
+                    "banner may display stale thread ID",
+                    prev_session_thread,
+                )
+            # Attempt to restore the previous thread's visible history
+            try:
+                await self._load_thread_history()
+            except Exception:
+                logger.debug(
+                    "Could not restore previous thread history after "
+                    "failed switch to %s",
+                    thread_id,
+                )
+            await self._mount_message(
+                AppMessage(
+                    f"Failed to switch to thread {thread_id}: {exc}. "
+                    "Use /threads to try again."
+                )
+            )
+
     async def _switch_model(self, model_spec: str) -> None:
         """Switch to a new model, preserving conversation history.
 
@@ -1735,6 +1928,17 @@ class DeepAgentsApp(App):
             await self._mount_message(ErrorMessage(f"Failed to create model: {e}"))
             return
 
+        # When switching models, settings must be updated before
+        # create_cli_agent because it builds the system prompt from global
+        # settings (model name, provider, context limit). Otherwise the
+        # prompt would describe the old model to the new one.
+        #
+        # Save previous values for rollback if agent creation fails.
+        prev_name = settings.model_name
+        prev_provider = settings.model_provider
+        prev_context_limit = settings.model_context_limit
+        result.apply_to_settings()
+
         try:
             new_agent, new_backend = create_cli_agent(
                 model=result.model,
@@ -1746,12 +1950,13 @@ class DeepAgentsApp(App):
                 checkpointer=self._checkpointer,
             )
         except Exception as e:
+            # Roll back settings so the running agent isn't misrepresented.
+            settings.model_name = prev_name
+            settings.model_provider = prev_provider
+            settings.model_context_limit = prev_context_limit
             logger.exception("Failed to create agent for model switch")
             await self._mount_message(ErrorMessage(f"Model switch failed: {e}"))
             return
-
-        # Both model and agent succeeded — now commit to settings atomically.
-        result.apply_to_settings()
 
         # Swap agent
         self._agent = new_agent
