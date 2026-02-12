@@ -242,7 +242,7 @@ def _validate_skill_name(name: str, directory_name: str) -> tuple[bool, str]:
     return True, ""
 
 
-def _parse_skill_metadata(  # noqa: PLR0912
+def _parse_skill_metadata(
     content: str,
     skill_path: str,
     directory_name: str,
@@ -312,19 +312,19 @@ def _parse_skill_metadata(  # noqa: PLR0912
         description_str = description_str[:MAX_SKILL_DESCRIPTION_LENGTH]
 
     raw_tools = frontmatter_data.get("allowed-tools")
-    if raw_tools:
-        if isinstance(raw_tools, list):
-            allowed_tools = [t.strip() for t in raw_tools if isinstance(t, str) and t.strip()]
-        elif isinstance(raw_tools, str):
-            allowed_tools = raw_tools.split()
-        else:
-            logger.warning(
-                "Invalid 'allowed-tools' type %s in %s; expected list or string. Ignoring value.",
-                type(raw_tools).__name__,
-                skill_path,
-            )
-            allowed_tools = []
+    if isinstance(raw_tools, str):
+        allowed_tools = [
+            t.strip(",")  # Support commas for compatibility with skills created for Claude Code.
+            for t in raw_tools.split()
+            if t.strip(",")
+        ]
     else:
+        if raw_tools is not None:
+            logger.warning(
+                "Ignoring non-string 'allowed-tools' in %s (got %s)",
+                skill_path,
+                type(raw_tools).__name__,
+            )
         allowed_tools = []
 
     compatibility_str = str(frontmatter_data.get("compatibility", "")).strip() or None
@@ -664,7 +664,7 @@ class SkillsMiddleware(AgentMiddleware):
                 config=config,
                 tool_call_id=None,
             )
-            backend = self._backend(tool_runtime)
+            backend = self._backend(tool_runtime)  # type: ignore[arg-type]
             if backend is None:
                 raise AssertionError("SkillsMiddleware requires a valid backend instance")
             return backend
@@ -723,7 +723,7 @@ class SkillsMiddleware(AgentMiddleware):
 
         return request.override(system_message=new_system_message)
 
-    def before_agent(self, state: SkillsState, runtime: Runtime, config: RunnableConfig) -> SkillsStateUpdate | None:
+    def before_agent(self, state: SkillsState, runtime: Runtime, config: RunnableConfig) -> SkillsStateUpdate | None:  # type: ignore[override]
         """Load skills metadata before agent execution (synchronous).
 
         Runs before each agent interaction to discover available skills from all
@@ -758,7 +758,7 @@ class SkillsMiddleware(AgentMiddleware):
         skills = list(all_skills.values())
         return SkillsStateUpdate(skills_metadata=skills)
 
-    async def abefore_agent(self, state: SkillsState, runtime: Runtime, config: RunnableConfig) -> SkillsStateUpdate | None:
+    async def abefore_agent(self, state: SkillsState, runtime: Runtime, config: RunnableConfig) -> SkillsStateUpdate | None:  # type: ignore[override]
         """Load skills metadata before agent execution (async).
 
         Runs before each agent interaction to discover available skills from all

@@ -1,11 +1,12 @@
 """Deep Agents come with planning, filesystem, and subagents."""
+# ruff: noqa: ERA001
 
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import Any, cast
 
 from langchain.agents import create_agent
 from langchain.agents.middleware import HumanInTheLoopMiddleware, InterruptOnConfig, TodoListMiddleware
-from langchain.agents.middleware.types import AgentMiddleware
+from langchain.agents.middleware.types import AgentMiddleware, ContextT, ResponseT
 from langchain.agents.structured_output import ResponseFormat
 from langchain.chat_models import init_chat_model
 from langchain_anthropic import ChatAnthropic
@@ -30,7 +31,7 @@ from deepagents.middleware.subagents import (
     SubAgent,
     SubAgentMiddleware,
 )
-from deepagents.middleware.summarization import SummarizationMiddleware, _compute_summarization_defaults
+from deepagents.middleware.summarization import _compute_summarization_defaults, _DeepAgentsSummarizationMiddleware
 
 BASE_AGENT_PROMPT = "In order to complete the objective that the user asks of you, you have access to a number of standard tools."
 
@@ -43,7 +44,7 @@ def get_default_model() -> ChatAnthropic:
     """
     return ChatAnthropic(
         model_name="claude-sonnet-4-5-20250929",
-        max_tokens=20000,  # type: ignore[call-arg]
+        max_tokens=20000,
     )
 
 
@@ -52,12 +53,12 @@ def create_deep_agent(
     tools: Sequence[BaseTool | Callable | dict[str, Any]] | None = None,
     *,
     system_prompt: str | SystemMessage | None = None,
-    middleware: Sequence[AgentMiddleware] = (),
+    middleware: Sequence[AgentMiddleware[Any, ContextT, ResponseT]] = (),
     subagents: list[SubAgent | CompiledSubAgent] | None = None,
     skills: list[str] | None = None,
     memory: list[str] | None = None,
-    response_format: ResponseFormat | None = None,
-    context_schema: type[Any] | None = None,
+    response_format: ResponseFormat[ResponseT] | type[ResponseT] | dict[str, Any] | None = None,
+    context_schema: type[ContextT] | None = None,
     checkpointer: Checkpointer | None = None,
     store: BaseStore | None = None,
     backend: BackendProtocol | BackendFactory | None = None,
@@ -144,7 +145,23 @@ def create_deep_agent(
     if model is None:
         model = get_default_model()
     elif isinstance(model, str):
-        model = init_chat_model(model)
+        if model.startswith("openai:"):
+            # Use Responses API by default. To use chat completions, use
+            # `model=init_chat_model("openai:...")`
+            # To disable data retention with the Responses API, use
+            # ```
+            # model=init_chat_model(
+            #     "openai:...",
+            #     use_responses_api=True,
+            #     store=False,
+            #     include=["reasoning.encrypted_content"],
+            # )
+            # ```
+            model_init_params: dict = {"use_responses_api": True}
+        else:
+            model_init_params = {}
+
+        model = init_chat_model(model, **model_init_params)
 
     # Compute summarization defaults based on model profile
     summarization_defaults = _compute_summarization_defaults(model)
@@ -152,10 +169,11 @@ def create_deep_agent(
     backend = backend if backend is not None else (StateBackend)
 
     # Build general-purpose subagent with default middleware stack
-    gp_middleware: list[AgentMiddleware] = [
+    gp_middleware: list[AgentMiddleware[Any, Any, Any]] = []
+    gp_middleware += [
         TodoListMiddleware(),
         FilesystemMiddleware(backend=backend),
-        SummarizationMiddleware(
+        _DeepAgentsSummarizationMiddleware(
             model=model,
             backend=backend,
             trigger=summarization_defaults["trigger"],
@@ -171,7 +189,7 @@ def create_deep_agent(
     if interrupt_on is not None:
         gp_middleware.append(HumanInTheLoopMiddleware(interrupt_on=interrupt_on))
 
-    general_purpose_spec: SubAgent = {
+    general_purpose_spec: SubAgent = {  # type: ignore[missing-typed-dict-key]
         **GENERAL_PURPOSE_SUBAGENT,
         "model": model,
         "tools": tools or [],
@@ -186,16 +204,17 @@ def create_deep_agent(
             processed_subagents.append(spec)
         else:
             # SubAgent - fill in defaults and prepend base middleware
-            subagent_model = spec.get("model", model)
+            subagent_model: str | BaseChatModel = cast("str | BaseChatModel", spec.get("model", model))
             if isinstance(subagent_model, str):
                 subagent_model = init_chat_model(subagent_model)
 
             # Build middleware: base stack + skills (if specified) + user's middleware
             subagent_summarization_defaults = _compute_summarization_defaults(subagent_model)
-            subagent_middleware: list[AgentMiddleware] = [
+            subagent_middleware: list[AgentMiddleware[Any, Any, Any]] = []
+            subagent_middleware += [
                 TodoListMiddleware(),
                 FilesystemMiddleware(backend=backend),
-                SummarizationMiddleware(
+                _DeepAgentsSummarizationMiddleware(
                     model=subagent_model,
                     backend=backend,
                     trigger=subagent_summarization_defaults["trigger"],
@@ -211,7 +230,7 @@ def create_deep_agent(
                 subagent_middleware.append(SkillsMiddleware(backend=backend, sources=subagent_skills))
             subagent_middleware.extend(spec.get("middleware", []))
 
-            processed_spec: SubAgent = {
+            processed_spec: SubAgent = {  # type: ignore[missing-typed-dict-key]
                 **spec,
                 "model": subagent_model,
                 "tools": spec.get("tools", tools or []),
@@ -223,9 +242,8 @@ def create_deep_agent(
     all_subagents: list[SubAgent | CompiledSubAgent] = [general_purpose_spec, *processed_subagents]
 
     # Build main agent middleware stack
-    deepagent_middleware: list[AgentMiddleware] = [
-        TodoListMiddleware(),
-    ]
+    deepagent_middleware: list[AgentMiddleware[Any, Any, Any]] = []
+    deepagent_middleware.append(TodoListMiddleware())
     if memory is not None:
         deepagent_middleware.append(MemoryMiddleware(backend=backend, sources=memory))
     if skills is not None:
@@ -237,7 +255,7 @@ def create_deep_agent(
                 backend=backend,
                 subagents=all_subagents,
             ),
-            SummarizationMiddleware(
+            _DeepAgentsSummarizationMiddleware(
                 model=model,
                 backend=backend,
                 trigger=summarization_defaults["trigger"],
@@ -263,7 +281,7 @@ def create_deep_agent(
             *system_prompt.content_blocks,
             {"type": "text", "text": f"\n\n{BASE_AGENT_PROMPT}"},
         ]
-        final_system_prompt = SystemMessage(content=new_content)
+        final_system_prompt = SystemMessage(content=new_content)  # type: ignore[arg-type]
     else:
         # String: simple concatenation
         final_system_prompt = system_prompt + "\n\n" + BASE_AGENT_PROMPT
