@@ -1488,6 +1488,13 @@ def create_model(
         provider_for_init = "openai"
         kwargs.setdefault("base_url", settings.ollama_base_url)
         kwargs.setdefault("api_key", "local")
+    elif provider == "azure_openai":
+        if settings.azure_openai_api_key:
+            kwargs.setdefault("api_key", settings.azure_openai_api_key)
+        if settings.azure_openai_endpoint:
+            kwargs.setdefault("azure_endpoint", settings.azure_openai_endpoint)
+        if settings.azure_openai_api_version:
+            kwargs.setdefault("api_version", settings.azure_openai_api_version)
     elif provider == "lmstudio":
         provider_for_init = "openai"
         if settings.lmstudio_base_url:

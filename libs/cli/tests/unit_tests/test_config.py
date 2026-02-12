@@ -525,6 +525,12 @@ class TestCreateModelAdditionalProviders:
                 mock_init_chat_model.call_args.kwargs["model_provider"]
                 == "azure_openai"
             )
+            assert mock_init_chat_model.call_args.kwargs["api_key"] == "azure-key"
+            assert (
+                mock_init_chat_model.call_args.kwargs["azure_endpoint"]
+                == "https://ai.mycorp.com/"
+            )
+            assert mock_init_chat_model.call_args.kwargs["api_version"] == "2024-10-21"
         finally:
             self._restore_provider_settings(saved)
 
