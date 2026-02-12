@@ -18,7 +18,7 @@ LangSmith is a unified developer platform for building, testing, and monitoring 
 
 ```bash
 uv tool install deepagents-cli
-deepagents
+deepagents-custom
 ```
 
 ## Model providers
@@ -35,7 +35,7 @@ Uses Ollama's OpenAI-compatible server.
 export OLLAMA_BASE_URL="http://localhost:11434/v1"
 export OLLAMA_MODEL="llama3"
 
-deepagents --model ollama:llama3
+deepagents-custom --model ollama:llama3
 ```
 
 ### LM Studio (local)
@@ -46,7 +46,7 @@ Uses LM Studio's OpenAI-compatible server.
 export LMSTUDIO_BASE_URL="http://localhost:1234/v1"
 export LMSTUDIO_MODEL="your-model"
 
-deepagents --model lmstudio:your-model
+deepagents-custom --model lmstudio:your-model
 ```
 
 ### Azure OpenAI (custom domain supported)
@@ -59,7 +59,7 @@ export AZURE_OPENAI_API_KEY="..."
 export AZURE_OPENAI_API_VERSION="2024-10-21"
 export AZURE_OPENAI_DEPLOYMENT="my-deployment"
 
-deepagents --model azure:my-deployment
+deepagents-custom --model azure:my-deployment
 ```
 
 ## 🤔 What is this?
