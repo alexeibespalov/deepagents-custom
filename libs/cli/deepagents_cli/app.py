@@ -118,6 +118,35 @@ def _extract_mcp_servers(data: object) -> dict[str, object]:
 
     return {}
 
+
+def _maybe_mcp_tls_hint(errors: list[str]) -> str | None:
+    """Return a troubleshooting hint for common MCP TLS failures.
+
+    This is primarily aimed at Node-based MCP wrappers (e.g. `npx mcp-remote`)
+    running behind corporate TLS interception proxies.
+
+    Args:
+        errors: Collected MCP server connection errors.
+
+    Returns:
+        A user-facing hint string, or `None` if no known TLS pattern matches.
+    """
+
+    combined = "\n".join(errors).lower()
+    tls_markers = (
+        "unable_to_get_issuer_cert_locally",
+        "unable to get local issuer certificate",
+        "self signed certificate in certificate chain",
+        "certificate_verify_failed",
+    )
+    if any(marker in combined for marker in tls_markers):
+        return (
+            "Tip: If this is a Node TLS trust issue (common behind corporate proxies), "
+            "set NODE_OPTIONS=--use-system-ca. If that isn't available, export your "
+            "corporate root CA and set NODE_EXTRA_CA_CERTS=/path/to/corp-root.pem."
+        )
+    return None
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -588,6 +617,9 @@ class DeepAgentsApp(App):
                     "Warnings:",
                     *[f"- {err}" for err in self._mcp_errors],
                 ]
+                hint = _maybe_mcp_tls_hint(self._mcp_errors)
+                if hint:
+                    lines.extend(["", hint])
                 self.call_after_refresh(
                     lambda: asyncio.create_task(
                         self._mount_message(AppMessage("\n".join(lines)))

@@ -62,6 +62,49 @@ export AZURE_OPENAI_DEPLOYMENT="my-deployment"
 deepagents-custom --model azure:my-deployment
 ```
 
+## MCP servers
+
+The CLI can load tool servers from a `.mcp.json` file (searched upward from your current working directory). MCP tools appear in `/tools` namespaced as `{server}__{tool}`.
+
+### Example `.mcp.json`
+
+```json
+{
+  "mcpServers": {
+    "tavily-remote-mcp": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-remote",
+        "https://mcp.tavily.com/mcp/?tavilyApiKey=REDACTED"
+      ]
+    }
+  }
+}
+```
+
+### TLS troubleshooting (corporate proxies)
+
+If you see `UNABLE_TO_GET_ISSUER_CERT_LOCALLY` from Node-based MCP wrappers (for example `mcp-remote`), you're usually behind a TLS-intercepting proxy that is trusted by macOS Keychain but not by Node.
+
+Fix by using the system CA store:
+
+```json
+{
+  "mcpServers": {
+    "tavily-remote-mcp": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "https://mcp.tavily.com/mcp/?tavilyApiKey=REDACTED"],
+      "env": {
+        "NODE_OPTIONS": "--use-system-ca"
+      }
+    }
+  }
+}
+```
+
+If `--use-system-ca` doesn't work in your environment, export your corporate root CA certificate as a PEM file and set `NODE_EXTRA_CA_CERTS` to point to it.
+
 ## 🤔 What is this?
 
 Using an LLM to call tools in a loop is the simplest form of an agent. This architecture, however, can yield agents that are "shallow" and fail to plan and act over longer, more complex tasks.

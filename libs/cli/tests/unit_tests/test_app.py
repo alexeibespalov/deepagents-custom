@@ -619,6 +619,34 @@ class TestTraceCommand:
 class TestDiscoveryCommands:
     """Tests for discoverability slash commands (/tools, /skills, /mcp)."""
 
+
+class TestMcpStartupHints:
+    """Tests for MCP startup status hints."""
+
+    @pytest.mark.asyncio
+    async def test_mcp_startup_warns_about_node_tls_trust(self, tmp_path) -> None:
+        config_path = tmp_path / ".mcp.json"
+        config_path.write_text("{}")
+
+        app = DeepAgentsApp(
+            mcp_config_path=config_path,
+            mcp_tool_count=0,
+            mcp_errors=[
+                "Failed to connect MCP server 'tavily': McpError: "
+                "UNABLE_TO_GET_ISSUER_CERT_LOCALLY"
+            ],
+        )
+
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            await pilot.pause()
+
+            app_msgs = app.query(AppMessage)
+            rendered = "\n".join(str(w._content) for w in app_msgs)
+
+            assert "NODE_OPTIONS" in rendered
+            assert "--use-system-ca" in rendered
+
     @pytest.mark.asyncio
     async def test_tools_lists_built_in_tools(self) -> None:
         app = DeepAgentsApp()
