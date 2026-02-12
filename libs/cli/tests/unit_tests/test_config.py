@@ -1,5 +1,6 @@
 """Tests for config module including project discovery utilities."""
 
+import os
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -23,6 +24,56 @@ from deepagents_cli.config import (
     validate_model_capabilities,
 )
 from deepagents_cli.model_config import ModelConfigError, clear_caches
+
+
+class TestDotenvLoading:
+    """Tests for `.env` loading behavior."""
+
+    def test_load_dotenv_from_cwd(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Confirm `.env` in the current working directory is loaded."""
+
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text("DEEPAGENTS_DOTENV_TEST=1\n")
+
+        monkeypatch.delenv("DEEPAGENTS_DOTENV_TEST", raising=False)
+
+        import deepagents_cli.config as config
+
+        config._load_dotenv_from_cwd()
+        assert os.environ.get("DEEPAGENTS_DOTENV_TEST") == "1"
+
+    def test_dotenv_overrides_empty_env_var(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Confirm `.env` populates variables that are set but empty."""
+
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text("AZURE_OPENAI_DEPLOYMENT=from_dotenv\n")
+
+        monkeypatch.setenv("AZURE_OPENAI_DEPLOYMENT", "")
+
+        import deepagents_cli.config as config
+
+        config._load_dotenv_from_cwd()
+        assert os.environ.get("AZURE_OPENAI_DEPLOYMENT") == "from_dotenv"
+
+
+class TestAzureDeploymentEnvAliases:
+    """Tests for Azure deployment environment variable aliases."""
+
+    def test_settings_reads_azure_deployment_alias(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Confirm `AZURE_OPENAI_API_DEPLOYMENT_NAME` is accepted."""
+
+        monkeypatch.setenv("AZURE_OPENAI_API_KEY", "key")
+        monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://example.openai.azure.com")
+        monkeypatch.setenv("AZURE_OPENAI_API_VERSION", "2025-01-01-preview")
+        monkeypatch.delenv("AZURE_OPENAI_DEPLOYMENT", raising=False)
+        monkeypatch.setenv("AZURE_OPENAI_API_DEPLOYMENT_NAME", "my-deployment")
+
+        settings_obj = Settings.from_environment()
+        assert settings_obj.azure_openai_deployment == "my-deployment"
 
 
 class TestProjectRootDetection:
@@ -355,6 +406,125 @@ class TestCreateModelProfileExtraction:
 
         result = create_model("anthropic:claude-sonnet-4-5")
         assert result.context_limit is None
+
+
+class TestCreateModelAdditionalProviders:
+    """Tests for additional providers in create_model()."""
+
+    def setup_method(self) -> None:
+        settings.model_context_limit = None
+        settings.model_name = None
+        settings.model_provider = None
+
+    def _save_provider_settings(self) -> dict[str, object]:
+        return {
+            "openai_api_key": settings.openai_api_key,
+            "anthropic_api_key": settings.anthropic_api_key,
+            "google_api_key": settings.google_api_key,
+            "google_cloud_project": settings.google_cloud_project,
+            "azure_openai_api_key": settings.azure_openai_api_key,
+            "azure_openai_endpoint": settings.azure_openai_endpoint,
+            "azure_openai_api_version": settings.azure_openai_api_version,
+            "azure_openai_deployment": settings.azure_openai_deployment,
+            "ollama_base_url": settings.ollama_base_url,
+            "ollama_model": settings.ollama_model,
+            "lmstudio_base_url": settings.lmstudio_base_url,
+            "lmstudio_model": settings.lmstudio_model,
+        }
+
+    def _restore_provider_settings(self, saved: dict[str, object]) -> None:
+        settings.openai_api_key = saved["openai_api_key"]  # type: ignore[assignment]
+        settings.anthropic_api_key = saved["anthropic_api_key"]  # type: ignore[assignment]
+        settings.google_api_key = saved["google_api_key"]  # type: ignore[assignment]
+        settings.google_cloud_project = saved["google_cloud_project"]  # type: ignore[assignment]
+        settings.azure_openai_api_key = saved["azure_openai_api_key"]  # type: ignore[assignment]
+        settings.azure_openai_endpoint = saved["azure_openai_endpoint"]  # type: ignore[assignment]
+        settings.azure_openai_api_version = saved["azure_openai_api_version"]  # type: ignore[assignment]
+        settings.azure_openai_deployment = saved["azure_openai_deployment"]  # type: ignore[assignment]
+        settings.ollama_base_url = saved["ollama_base_url"]  # type: ignore[assignment]
+        settings.ollama_model = saved["ollama_model"]  # type: ignore[assignment]
+        settings.lmstudio_base_url = saved["lmstudio_base_url"]  # type: ignore[assignment]
+        settings.lmstudio_model = saved["lmstudio_model"]  # type: ignore[assignment]
+
+    @patch("deepagents_cli.config.init_chat_model")
+    def test_creates_ollama_model_with_api_base(self, mock_init_chat_model: Mock) -> None:
+        mock_model = Mock()
+        mock_model.profile = {"tool_calling": True}
+        mock_init_chat_model.return_value = mock_model
+
+        saved = self._save_provider_settings()
+        try:
+            settings.openai_api_key = None
+            settings.anthropic_api_key = None
+            settings.google_api_key = None
+            settings.google_cloud_project = None
+
+            settings.ollama_base_url = "http://localhost:11434/v1"
+            settings.lmstudio_base_url = None
+
+            result = create_model("ollama:llama3")
+            assert isinstance(result, ModelResult)
+            mock_init_chat_model.assert_called_once()
+            assert mock_init_chat_model.call_args.args[0] == "llama3"
+            assert mock_init_chat_model.call_args.kwargs["model_provider"] == "openai"
+            assert mock_init_chat_model.call_args.kwargs["base_url"] == "http://localhost:11434/v1"
+            assert mock_init_chat_model.call_args.kwargs["api_key"] == "local"
+        finally:
+            self._restore_provider_settings(saved)
+
+    @patch("deepagents_cli.config.init_chat_model")
+    def test_creates_lmstudio_model_with_api_base(self, mock_init_chat_model: Mock) -> None:
+        mock_model = Mock()
+        mock_model.profile = {"tool_calling": True}
+        mock_init_chat_model.return_value = mock_model
+
+        saved = self._save_provider_settings()
+        try:
+            settings.openai_api_key = None
+            settings.anthropic_api_key = None
+            settings.google_api_key = None
+            settings.google_cloud_project = None
+
+            settings.ollama_base_url = None
+            settings.lmstudio_base_url = "http://localhost:1234/v1"
+
+            result = create_model("lmstudio:my-model")
+            assert isinstance(result, ModelResult)
+            mock_init_chat_model.assert_called_once()
+            assert mock_init_chat_model.call_args.args[0] == "my-model"
+            assert mock_init_chat_model.call_args.kwargs["model_provider"] == "openai"
+            assert mock_init_chat_model.call_args.kwargs["base_url"] == "http://localhost:1234/v1"
+            assert mock_init_chat_model.call_args.kwargs["api_key"] == "local"
+        finally:
+            self._restore_provider_settings(saved)
+
+    @patch("deepagents_cli.config.init_chat_model")
+    def test_creates_azure_model_with_custom_endpoint(self, mock_init_chat_model: Mock) -> None:
+        mock_model = Mock()
+        mock_model.profile = {"tool_calling": True}
+        mock_init_chat_model.return_value = mock_model
+
+        saved = self._save_provider_settings()
+        try:
+            settings.openai_api_key = None
+            settings.anthropic_api_key = None
+            settings.google_api_key = None
+            settings.google_cloud_project = None
+
+            settings.azure_openai_api_key = "azure-key"
+            settings.azure_openai_endpoint = "https://ai.mycorp.com/"
+            settings.azure_openai_api_version = "2024-10-21"
+
+            result = create_model("azure:my-deployment")
+            assert isinstance(result, ModelResult)
+            mock_init_chat_model.assert_called_once()
+            assert mock_init_chat_model.call_args.args[0] == "my-deployment"
+            assert (
+                mock_init_chat_model.call_args.kwargs["model_provider"]
+                == "azure_openai"
+            )
+        finally:
+            self._restore_provider_settings(saved)
 
 
 class TestParseShellAllowList:

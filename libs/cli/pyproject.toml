@@ -84,7 +84,7 @@ all-providers = [
 ]
 
 [project.scripts]
-deepagents = "deepagents_cli:cli_main"
+deepagents-custom = "deepagents_cli:cli_main"
 deepagents-cli = "deepagents_cli:cli_main"
 
 [project.urls]

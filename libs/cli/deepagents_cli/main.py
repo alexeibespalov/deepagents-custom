@@ -248,7 +248,9 @@ def parse_args() -> argparse.Namespace:
         "--model",
         metavar="MODEL",
         help="Model to use (e.g., claude-sonnet-4-5-20250929, gpt-5.2). "
-        "Provider is auto-detected from model name.",
+        "Provider is auto-detected from model name, or specify explicitly as provider:model "
+        "(e.g., ollama:llama3, lmstudio:your-model, azure:your-deployment). "
+        "Use /model in the UI to see configured options.",
     )
 
     parser.add_argument(

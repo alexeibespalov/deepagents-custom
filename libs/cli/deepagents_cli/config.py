@@ -8,6 +8,7 @@ import re
 import shlex
 import sys
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from importlib.metadata import PackageNotFoundError, distribution
@@ -21,7 +22,28 @@ from deepagents_cli._version import __version__
 
 logger = logging.getLogger(__name__)
 
-dotenv.load_dotenv()
+def _load_dotenv_from_cwd() -> None:
+    """Load environment variables from a `.env` file.
+
+    We intentionally search from the *current working directory* so that running the
+    installed CLI inside a project folder picks up that project's `.env`.
+    """
+
+    dotenv_path = dotenv.find_dotenv(usecwd=True)
+    if dotenv_path:
+        dotenv_values = dotenv.dotenv_values(dotenv_path)
+        for key, value in dotenv_values.items():
+            if value is None:
+                continue
+
+            existing_value = os.environ.get(key)
+            if existing_value in {None, ""}:
+                os.environ[key] = value
+    else:
+        dotenv.load_dotenv()
+
+
+_load_dotenv_from_cwd()
 
 # CRITICAL: Override LANGSMITH_PROJECT to route agent traces to separate project
 # LangSmith reads LANGSMITH_PROJECT at invocation time, so we override it here
@@ -432,6 +454,18 @@ class Settings:
     google_api_key: str | None
     tavily_api_key: str | None
 
+    # Azure OpenAI configuration
+    azure_openai_api_key: str | None
+    azure_openai_endpoint: str | None
+    azure_openai_api_version: str | None
+    azure_openai_deployment: str | None
+
+    # Local OpenAI-compatible providers
+    ollama_base_url: str | None
+    ollama_model: str | None
+    lmstudio_base_url: str | None
+    lmstudio_model: str | None
+
     # Google Cloud configuration (for VertexAI)
     google_cloud_project: str | None
 
@@ -467,6 +501,18 @@ class Settings:
         tavily_key = os.environ.get("TAVILY_API_KEY")
         google_cloud_project = os.environ.get("GOOGLE_CLOUD_PROJECT")
 
+        azure_openai_api_key = os.environ.get("AZURE_OPENAI_API_KEY")
+        azure_openai_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
+        azure_openai_api_version = os.environ.get("AZURE_OPENAI_API_VERSION")
+        azure_openai_deployment = os.environ.get("AZURE_OPENAI_DEPLOYMENT") or os.environ.get(
+            "AZURE_OPENAI_API_DEPLOYMENT_NAME"
+        )
+
+        ollama_base_url = os.environ.get("OLLAMA_BASE_URL")
+        ollama_model = os.environ.get("OLLAMA_MODEL")
+        lmstudio_base_url = os.environ.get("LMSTUDIO_BASE_URL")
+        lmstudio_model = os.environ.get("LMSTUDIO_MODEL")
+
         # Detect LangSmith configuration
         # DEEPAGENTS_LANGSMITH_PROJECT: Project for deepagents agent tracing
         # user_langchain_project: User's ORIGINAL LANGSMITH_PROJECT (before override)
@@ -489,6 +535,14 @@ class Settings:
             anthropic_api_key=anthropic_key,
             google_api_key=google_key,
             tavily_api_key=tavily_key,
+            azure_openai_api_key=azure_openai_api_key,
+            azure_openai_endpoint=azure_openai_endpoint,
+            azure_openai_api_version=azure_openai_api_version,
+            azure_openai_deployment=azure_openai_deployment,
+            ollama_base_url=ollama_base_url,
+            ollama_model=ollama_model,
+            lmstudio_base_url=lmstudio_base_url,
+            lmstudio_model=lmstudio_model,
             google_cloud_project=google_cloud_project,
             deepagents_langchain_project=deepagents_langchain_project,
             user_langchain_project=user_langchain_project,
@@ -510,6 +564,25 @@ class Settings:
     def has_google(self) -> bool:
         """Check if Google API key is configured."""
         return self.google_api_key is not None
+
+    @property
+    def has_azure_openai(self) -> bool:
+        """Check if Azure OpenAI is configured via environment variables."""
+        return (
+            self.azure_openai_api_key is not None
+            and self.azure_openai_endpoint is not None
+            and self.azure_openai_api_version is not None
+        )
+
+    @property
+    def has_ollama(self) -> bool:
+        """Check if an Ollama OpenAI-compatible endpoint is configured."""
+        return self.ollama_base_url is not None
+
+    @property
+    def has_lmstudio(self) -> bool:
+        """Check if an LM Studio OpenAI-compatible endpoint is configured."""
+        return self.lmstudio_base_url is not None
 
     @property
     def has_vertex_ai(self) -> bool:
@@ -1070,9 +1143,20 @@ def detect_provider(model_name: str) -> str | None:
 
     return None
 
+_PROVIDER_ALIASES: dict[str, str] = {
+    "google": "google_genai",
+    "vertexai": "google_vertexai",
+    "azure": "azure_openai",
+    "azure-openai": "azure_openai",
+    "azure_openai": "azure_openai",
+    "lm-studio": "lmstudio",
+    "lm_studio": "lmstudio",
+}
+
 
 def _get_default_model_spec() -> str:
     """Get default model specification based on available credentials.
+
 
     Checks in order:
 
@@ -1096,6 +1180,19 @@ def _get_default_model_spec() -> str:
     if settings.has_openai:
         model = os.environ.get("OPENAI_MODEL", "gpt-5.2")
         return f"openai:{model}"
+
+    if settings.has_azure_openai:
+        deployment = settings.azure_openai_deployment or os.environ.get(
+            "AZURE_OPENAI_DEPLOYMENT"
+        )
+        if not deployment:
+            msg = (
+                "Azure OpenAI is configured but no deployment was provided. "
+                "Set AZURE_OPENAI_DEPLOYMENT (or AZURE_OPENAI_API_DEPLOYMENT_NAME) "
+                "or use --model azure_openai:<deployment>."
+            )
+            raise ModelConfigError(msg)
+        return f"azure_openai:{deployment}"
     if settings.has_anthropic:
         model = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5-20250929")
         return f"anthropic:{model}"
@@ -1105,6 +1202,24 @@ def _get_default_model_spec() -> str:
     if settings.has_vertex_ai:
         model = os.environ.get("VERTEX_AI_MODEL", "gemini-3-pro-preview")
         return f"google_vertexai:{model}"
+
+    if settings.has_ollama:
+        model = settings.ollama_model
+        if not model:
+            raise ModelConfigError(
+                "OLLAMA_BASE_URL is set but OLLAMA_MODEL is not set. "
+                "Set OLLAMA_MODEL or use --model ollama:<model>."
+            )
+        return f"ollama:{model}"
+
+    if settings.has_lmstudio:
+        model = settings.lmstudio_model
+        if not model:
+            raise ModelConfigError(
+                "LMSTUDIO_BASE_URL is set but LMSTUDIO_MODEL is not set. "
+                "Set LMSTUDIO_MODEL or use --model lmstudio:<model>."
+            )
+        return f"lmstudio:{model}"
 
     msg = (
         "No credentials configured. Please set one of: "
@@ -1338,8 +1453,21 @@ def create_model(
         model_name = model_spec
         provider = detect_provider(model_spec) or ""
 
+    provider = _PROVIDER_ALIASES.get(provider, provider)
+
     # Provider-specific kwargs (with per-model overrides)
+    provider_for_init = provider
     kwargs = _get_provider_kwargs(provider, model_name=model_name)
+
+    if provider == "ollama" and settings.ollama_base_url:
+        provider_for_init = "openai"
+        kwargs.setdefault("base_url", settings.ollama_base_url)
+        kwargs.setdefault("api_key", "local")
+    elif provider == "lmstudio":
+        provider_for_init = "openai"
+        if settings.lmstudio_base_url:
+            kwargs.setdefault("base_url", settings.lmstudio_base_url)
+        kwargs.setdefault("api_key", "local")
 
     # CLI --model-params take highest priority
     if extra_kwargs:
@@ -1347,12 +1475,14 @@ def create_model(
 
     # Check if this provider uses a custom BaseChatModel class
     config = ModelConfig.load()
-    class_path = config.get_class_path(provider) if provider else None
+    class_path = config.get_class_path(provider_for_init) if provider_for_init else None
 
     if class_path:
-        model = _create_model_from_class(class_path, model_name, provider, kwargs)
+        model = _create_model_from_class(
+            class_path, model_name, provider_for_init, kwargs
+        )
     else:
-        model = _create_model_via_init(model_name, provider, kwargs)
+        model = _create_model_via_init(model_name, provider_for_init, kwargs)
 
     resolved_provider = provider or getattr(model, "_model_provider", provider)
 

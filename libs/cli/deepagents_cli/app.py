@@ -1003,7 +1003,7 @@ class DeepAgentsApp(App):
                 "  Ctrl+J          Insert newline\n"
                 "  Shift+Tab       Toggle auto-approve mode\n"
                 "  @filename       Auto-complete files and inject content\n"
-                "  /command        Slash commands (/help, /clear, /quit)\n"
+                "  /command        Slash commands (/help, /model, /clear, /quit)\n"
                 "  !command        Run bash commands directly\n\n"
                 "Docs: https://docs.langchain.com/oss/python/deepagents/cli"
             )
