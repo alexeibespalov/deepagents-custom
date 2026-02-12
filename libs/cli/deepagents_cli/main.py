@@ -429,9 +429,12 @@ async def run_textual_cli_async(
     # Use async context manager for checkpointer
     async with get_checkpointer() as checkpointer:
         # Create agent with conditional tools
-        tools: list[Callable[..., Any] | dict[str, Any]] = [http_request, fetch_url]
+        base_tools: list[Callable[..., Any] | dict[str, Any]] = [http_request, fetch_url]
         if settings.has_tavily:
-            tools.append(web_search)
+            base_tools.append(web_search)
+
+        # Attach MCP tools (if configured via .mcp.json)
+        from deepagents_cli.mcp_tools import open_mcp_toolset  # noqa: PLC0415
 
         # Handle sandbox mode
         sandbox_backend = None
@@ -452,44 +455,59 @@ async def run_textual_cli_async(
                 console.print(Text(str(e), style="dim"))
                 sys.exit(1)
 
-        try:
-            agent, composite_backend = create_cli_agent(
-                model=model,
-                assistant_id=assistant_id,
-                tools=tools,
-                sandbox=sandbox_backend,
-                sandbox_type=sandbox_type if sandbox_type != "none" else None,
-                auto_approve=auto_approve,
-                checkpointer=checkpointer,
-            )
-        except Exception as e:
-            error_text = Text("❌ Failed to create agent: ", style="red")
-            error_text.append(str(e))
-            console.print(error_text)
-            sys.exit(1)
+        async with open_mcp_toolset(Path.cwd()) as mcp_toolset:
+            if mcp_toolset.errors:
+                console.print()
+                console.print("[yellow]MCP configuration warnings:[/yellow]")
+                for err in mcp_toolset.errors:
+                    console.print(f"[dim]- {err}[/dim]")
 
-        # Run Textual app - errors propagate to caller
-        return_code = 0
-        try:
-            return_code = await run_textual_app(
-                agent=agent,
-                assistant_id=assistant_id,
-                backend=composite_backend,
-                auto_approve=auto_approve,
-                cwd=Path.cwd(),
-                thread_id=thread_id,
-                initial_prompt=initial_prompt,
-                checkpointer=checkpointer,
-                tools=tools,
-                sandbox=sandbox_backend,
-                sandbox_type=sandbox_type if sandbox_type != "none" else None,
-            )
-        finally:
-            # Clean up sandbox after app exits (success or error)
-            if sandbox_cm is not None:
-                with contextlib.suppress(Exception):
-                    sandbox_cm.__exit__(None, None, None)
-        return return_code
+            all_tools: list[Callable[..., Any] | dict[str, Any]] = [
+                *base_tools,
+                *mcp_toolset.tools,
+            ]
+
+            try:
+                agent, composite_backend = create_cli_agent(
+                    model=model,
+                    assistant_id=assistant_id,
+                    tools=all_tools,
+                    sandbox=sandbox_backend,
+                    sandbox_type=sandbox_type if sandbox_type != "none" else None,
+                    auto_approve=auto_approve,
+                    checkpointer=checkpointer,
+                )
+            except Exception as e:
+                error_text = Text("❌ Failed to create agent: ", style="red")
+                error_text.append(str(e))
+                console.print(error_text)
+                sys.exit(1)
+
+            # Run Textual app - errors propagate to caller
+            return_code = 0
+            try:
+                return_code = await run_textual_app(
+                    agent=agent,
+                    assistant_id=assistant_id,
+                    backend=composite_backend,
+                    auto_approve=auto_approve,
+                    cwd=Path.cwd(),
+                    thread_id=thread_id,
+                    initial_prompt=initial_prompt,
+                    checkpointer=checkpointer,
+                    tools=all_tools,
+                    sandbox=sandbox_backend,
+                    sandbox_type=sandbox_type if sandbox_type != "none" else None,
+                    mcp_config_path=mcp_toolset.config_path,
+                    mcp_tool_count=len(mcp_toolset.tools),
+                    mcp_errors=mcp_toolset.errors,
+                )
+            finally:
+                # Clean up sandbox after app exits (success or error)
+                if sandbox_cm is not None:
+                    with contextlib.suppress(Exception):
+                        sandbox_cm.__exit__(None, None, None)
+            return return_code
 
 
 def apply_stdin_pipe(args: argparse.Namespace) -> None:

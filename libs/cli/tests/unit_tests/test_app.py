@@ -614,3 +614,141 @@ class TestTraceCommand:
 
             app_msgs = app.query(AppMessage)
             assert any("No active session" in str(w._content) for w in app_msgs)
+
+
+class TestDiscoveryCommands:
+    """Tests for discoverability slash commands (/tools, /skills, /mcp)."""
+
+    @pytest.mark.asyncio
+    async def test_tools_lists_built_in_tools(self) -> None:
+        app = DeepAgentsApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            await app._handle_command("/tools")
+            await pilot.pause()
+
+            app_msgs = app.query(AppMessage)
+            rendered = "\n".join(str(w._content) for w in app_msgs)
+            assert "Tools available" in rendered
+            assert "write_todos" in rendered
+            assert "read_file" in rendered
+            assert "execute" in rendered
+
+    @pytest.mark.asyncio
+    async def test_skills_lists_loaded_skills(self) -> None:
+        app = DeepAgentsApp(assistant_id="agent")
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            with patch(
+                "deepagents_cli.app.list_skills",
+                return_value=[
+                    {
+                        "name": "skill-a",
+                        "description": "Does A",
+                        "path": "/tmp/skill-a/SKILL.md",
+                        "license": None,
+                        "compatibility": None,
+                        "metadata": {},
+                        "allowed_tools": [],
+                        "source": "built-in",
+                    }
+                ],
+            ):
+                await app._handle_command("/skills")
+                await pilot.pause()
+
+            app_msgs = app.query(AppMessage)
+            rendered = "\n".join(str(w._content) for w in app_msgs)
+            assert "Skills available" in rendered
+            assert "skill-a" in rendered
+            assert "built-in" in rendered
+
+    @pytest.mark.asyncio
+    async def test_mcp_shows_no_config_when_missing(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        app = DeepAgentsApp(cwd=str(tmp_path))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            await app._handle_command("/mcp")
+            await pilot.pause()
+
+            app_msgs = app.query(AppMessage)
+            assert any("No .mcp.json" in str(w._content) for w in app_msgs)
+
+    @pytest.mark.asyncio
+    async def test_mcp_lists_configured_servers(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".mcp.json").write_text(
+            '{"mcpServers": {"docs": {"type": "http", "url": "https://example.com/mcp"}}}'
+        )
+
+        app = DeepAgentsApp(cwd=str(tmp_path))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            await app._handle_command("/mcp")
+            await pilot.pause()
+
+            app_msgs = app.query(AppMessage)
+            rendered = "\n".join(str(w._content) for w in app_msgs)
+            assert "Configured MCP servers" in rendered
+            assert "docs" in rendered
+            assert "https://example.com/mcp" in rendered
+
+    @pytest.mark.asyncio
+    async def test_mcp_supports_servers_wrapper(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".mcp.json").write_text(
+            '{"servers": {"docs": {"type": "http", "url": "https://example.com/mcp"}}}'
+        )
+
+        app = DeepAgentsApp(cwd=str(tmp_path))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            await app._handle_command("/mcp")
+            await pilot.pause()
+
+            app_msgs = app.query(AppMessage)
+            rendered = "\n".join(str(w._content) for w in app_msgs)
+            assert "Configured MCP servers" in rendered
+            assert "docs" in rendered
+            assert "https://example.com/mcp" in rendered
+
+    @pytest.mark.asyncio
+    async def test_mcp_supports_simplified_server_map(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".mcp.json").write_text(
+            '{"docs": {"type": "http", "url": "https://example.com/mcp"}}'
+        )
+
+        app = DeepAgentsApp(cwd=str(tmp_path))
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            await app._handle_command("/mcp")
+            await pilot.pause()
+
+            app_msgs = app.query(AppMessage)
+            rendered = "\n".join(str(w._content) for w in app_msgs)
+            assert "Configured MCP servers" in rendered
+            assert "docs" in rendered
+            assert "https://example.com/mcp" in rendered
+
+    @pytest.mark.asyncio
+    async def test_help_mentions_discovery_commands(self) -> None:
+        app = DeepAgentsApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+
+            await app._handle_command("/help")
+            await pilot.pause()
+
+            app_msgs = app.query(AppMessage)
+            rendered = "\n".join(str(w._content) for w in app_msgs)
+            assert "/tools" in rendered
+            assert "/skills" in rendered
+            assert "/mcp" in rendered

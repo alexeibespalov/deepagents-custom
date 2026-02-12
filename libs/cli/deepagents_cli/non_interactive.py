@@ -25,6 +25,7 @@ import logging
 import sys
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from langchain.agents.middleware.human_in_the_loop import ActionRequest, HITLRequest
@@ -625,41 +626,51 @@ async def run_non_interactive(
 
     try:
         async with get_checkpointer() as checkpointer:
-            tools = [http_request, fetch_url]
+            base_tools = [http_request, fetch_url]
             if settings.has_tavily:
-                tools.append(web_search)
+                base_tools.append(web_search)
 
-            # If an allow-list is provided, enable shell but disable
-            # auto-approve so HITL can gate commands. If no allow-list, disable
-            # shell entirely and auto-approve all other tools.
-            enable_shell = bool(settings.shell_allow_list)
-            use_auto_approve = not enable_shell
+            from deepagents_cli.mcp_tools import open_mcp_toolset  # noqa: PLC0415
 
-            agent, composite_backend = create_cli_agent(
-                model=model,
-                assistant_id=assistant_id,
-                tools=tools,
-                sandbox=sandbox_backend,
-                sandbox_type=sandbox_type if sandbox_type != "none" else None,
-                auto_approve=use_auto_approve,
-                enable_shell=enable_shell,
-                checkpointer=checkpointer,
-            )
+            async with open_mcp_toolset(Path.cwd()) as mcp_toolset:
+                if mcp_toolset.errors and not quiet:
+                    console.print("[yellow]MCP configuration warnings:[/yellow]")
+                    for err in mcp_toolset.errors:
+                        console.print(f"[dim]- {err}[/dim]")
 
-            file_op_tracker = FileOpTracker(
-                assistant_id=assistant_id, backend=composite_backend
-            )
+                tools = [*base_tools, *mcp_toolset.tools]
 
-            await _run_agent_loop(
-                agent,
-                message,
-                config,
-                console,
-                file_op_tracker,
-                quiet=quiet,
-                stream=stream,
-            )
-            return 0
+                # If an allow-list is provided, enable shell but disable
+                # auto-approve so HITL can gate commands. If no allow-list, disable
+                # shell entirely and auto-approve all other tools.
+                enable_shell = bool(settings.shell_allow_list)
+                use_auto_approve = not enable_shell
+
+                agent, composite_backend = create_cli_agent(
+                    model=model,
+                    assistant_id=assistant_id,
+                    tools=tools,
+                    sandbox=sandbox_backend,
+                    sandbox_type=sandbox_type if sandbox_type != "none" else None,
+                    auto_approve=use_auto_approve,
+                    enable_shell=enable_shell,
+                    checkpointer=checkpointer,
+                )
+
+                file_op_tracker = FileOpTracker(
+                    assistant_id=assistant_id, backend=composite_backend
+                )
+
+                await _run_agent_loop(
+                    agent,
+                    message,
+                    config,
+                    console,
+                    file_op_tracker,
+                    quiet=quiet,
+                    stream=stream,
+                )
+                return 0
 
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted[/yellow]")

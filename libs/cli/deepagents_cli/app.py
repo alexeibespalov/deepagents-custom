@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 
@@ -36,8 +37,10 @@ from deepagents_cli.config import (
     create_model,
     detect_provider,
     is_shell_command_allowed,
+    Settings,
     settings,
 )
+from deepagents_cli.skills.load import list_skills
 from deepagents_cli.model_config import (
     ModelConfigError,
     ModelSpec,
@@ -66,6 +69,54 @@ from deepagents_cli.widgets.thread_selector import ThreadSelectorScreen
 from deepagents_cli.widgets.welcome import WelcomeBanner
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_mcp_servers(data: object) -> dict[str, object]:
+    """Extract MCP server definitions from supported config formats.
+
+    The ecosystem has multiple common JSON shapes for MCP configuration.
+    This helper supports:
+
+    - Legacy wrapper: `{ "mcpServers": { "name": { ... } } }`
+    - Alternate wrapper: `{ "servers": { "name": { ... } } }`
+    - Simplified map: `{ "name": { ... }, "other": { ... } }`
+
+    Args:
+        data: Parsed JSON content.
+
+    Returns:
+        Mapping of server name to server config.
+    """
+    if not isinstance(data, dict):
+        return {}
+
+    servers = data.get("mcpServers")
+    if isinstance(servers, dict):
+        return servers  # type: ignore[return-value]
+
+    servers = data.get("servers")
+    if isinstance(servers, dict):
+        return servers  # type: ignore[return-value]
+
+    # Heuristic: treat the root dict as the server map if all values are dict-like
+    # and each appears to describe a server.
+    meta_keys = {"$schema", "version", "inputs", "env"}
+    candidate: dict[str, object] = {
+        k: v for k, v in data.items() if isinstance(k, str) and k not in meta_keys
+    }
+    if not candidate:
+        return {}
+
+    if not all(isinstance(v, dict) for v in candidate.values()):
+        return {}
+
+    def _looks_like_server(cfg: dict[str, object]) -> bool:
+        return any(key in cfg for key in ("command", "url", "type"))
+
+    if all(_looks_like_server(v) for v in candidate.values() if isinstance(v, dict)):
+        return candidate
+
+    return {}
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -404,6 +455,9 @@ class DeepAgentsApp(App):
         tools: list[Callable[..., Any] | dict[str, Any]] | None = None,
         sandbox: SandboxBackendProtocol | None = None,
         sandbox_type: str | None = None,
+        mcp_config_path: str | Path | None = None,
+        mcp_tool_count: int | None = None,
+        mcp_errors: list[str] | None = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the Deep Agents application.
@@ -436,6 +490,9 @@ class DeepAgentsApp(App):
         self._tools = tools or []
         self._sandbox = sandbox
         self._sandbox_type = sandbox_type
+        self._mcp_config_path = str(mcp_config_path) if mcp_config_path else None
+        self._mcp_tool_count = mcp_tool_count
+        self._mcp_errors = mcp_errors or []
         self._status_bar: StatusBar | None = None
         self._chat_input: ChatInput | None = None
         self._quit_pending = False
@@ -515,6 +572,35 @@ class DeepAgentsApp(App):
 
         # Size the spacer to fill remaining viewport below input
         self.call_after_refresh(self._size_initial_spacer)
+
+        if self._mcp_config_path:
+            if self._mcp_tool_count and self._mcp_tool_count > 0:
+                msg = (
+                    f"Loaded {self._mcp_tool_count} MCP tool(s) from {self._mcp_config_path}. "
+                    "Run /tools to list them (namespaced as server__tool)."
+                )
+                self.call_after_refresh(
+                    lambda: asyncio.create_task(self._mount_message(AppMessage(msg)))
+                )
+            elif self._mcp_errors:
+                lines = [
+                    f"MCP config found at {self._mcp_config_path}, but no MCP tools were attached.",
+                    "Warnings:",
+                    *[f"- {err}" for err in self._mcp_errors],
+                ]
+                self.call_after_refresh(
+                    lambda: asyncio.create_task(
+                        self._mount_message(AppMessage("\n".join(lines)))
+                    )
+                )
+            else:
+                msg = (
+                    f"MCP config found at {self._mcp_config_path}, but it exposed no tools. "
+                    "Run /mcp to inspect configuration."
+                )
+                self.call_after_refresh(
+                    lambda: asyncio.create_task(self._mount_message(AppMessage(msg)))
+                )
 
         # Auto-submit initial prompt if provided via -m flag.
         # This check must come first because _lc_thread_id and _agent are
@@ -1086,7 +1172,8 @@ class DeepAgentsApp(App):
             await self._mount_message(UserMessage(command))
             help_text = Text(
                 "Commands: /quit, /clear, /model [--default], /remember, "
-                "/tokens, /threads, /trace, /changelog, /docs, /feedback, /help\n\n"
+                "/tokens, /threads, /trace, /tools, /skills, /mcp, "
+                "/changelog, /docs, /feedback, /help\n\n"
                 "Interactive Features:\n"
                 "  Enter           Submit your message\n"
                 "  Ctrl+J          Insert newline\n"
@@ -1149,6 +1236,156 @@ class DeepAgentsApp(App):
                 )
             else:
                 await self._mount_message(AppMessage("No token usage yet"))
+        elif cmd == "/tools":
+            await self._mount_message(UserMessage(command))
+
+            built_in = [
+                "write_todos",
+                "read_todos",
+                "ls",
+                "read_file",
+                "write_file",
+                "edit_file",
+                "glob",
+                "grep",
+                "execute",
+                "task",
+            ]
+
+            cli_tool_names: list[str] = []
+            mcp_tool_names: list[str] = []
+            for tool in self._tools:
+                if isinstance(tool, dict):
+                    name = tool.get("name")
+                    if not isinstance(name, str):
+                        func = tool.get("function")
+                        if isinstance(func, dict):
+                            name = func.get("name")
+                    if isinstance(name, str) and name:
+                        cli_tool_names.append(name)
+                    continue
+
+                name = getattr(tool, "name", None) or getattr(tool, "__name__", None)
+                if not isinstance(name, str) or not name:
+                    continue
+
+                metadata = getattr(tool, "metadata", None)
+                if isinstance(metadata, dict) and metadata.get("source") == "mcp":
+                    mcp_tool_names.append(name)
+                else:
+                    cli_tool_names.append(name)
+
+            extra = sorted({n for n in cli_tool_names if n not in built_in})
+            mcp = sorted(set(mcp_tool_names))
+            lines = ["Tools available in this chat:", "", "Built-in:"]
+            lines.extend(f"  - {name}" for name in built_in)
+            if extra:
+                lines.append("")
+                lines.append("CLI-provided:")
+                lines.extend(f"  - {name}" for name in extra)
+            if mcp:
+                lines.append("")
+                lines.append("MCP-provided:")
+                lines.extend(f"  - {name}" for name in mcp)
+            await self._mount_message(AppMessage("\n".join(lines)))
+        elif cmd == "/skills":
+            await self._mount_message(UserMessage(command))
+
+            if not self._assistant_id:
+                await self._mount_message(
+                    AppMessage("No agent configured. Run with --agent flag.")
+                )
+                return
+
+            env_settings = Settings.from_environment(start_path=Path(self._cwd))
+            skills = list_skills(
+                built_in_skills_dir=env_settings.get_built_in_skills_dir(),
+                user_skills_dir=env_settings.get_user_skills_dir(self._assistant_id),
+                project_skills_dir=env_settings.get_project_skills_dir(),
+                user_agent_skills_dir=env_settings.get_user_agent_skills_dir(),
+                project_agent_skills_dir=env_settings.get_project_agent_skills_dir(),
+            )
+
+            if not skills:
+                await self._mount_message(AppMessage("No skills found."))
+                return
+
+            # Stable ordering for display
+            skills_sorted = sorted(skills, key=lambda s: (s.get("source", ""), s["name"]))
+            lines = ["Skills available in this chat:", ""]
+            for skill in skills_sorted:
+                source = skill.get("source", "unknown")
+                desc = skill.get("description", "")
+                if desc:
+                    lines.append(f"  - {skill['name']} ({source}) — {desc}")
+                else:
+                    lines.append(f"  - {skill['name']} ({source})")
+            await self._mount_message(AppMessage("\n".join(lines)))
+        elif cmd == "/mcp":
+            await self._mount_message(UserMessage(command))
+
+            start = Path(self._cwd)
+            mcp_path: Path | None = None
+            for candidate_dir in (start, *start.parents):
+                candidate = candidate_dir / ".mcp.json"
+                if candidate.exists():
+                    mcp_path = candidate
+                    break
+
+            if not mcp_path:
+                await self._mount_message(
+                    AppMessage(
+                        "No .mcp.json found (searched from current directory upward)."
+                    )
+                )
+                return
+
+            try:
+                data = json.loads(mcp_path.read_text())
+            except Exception as e:
+                await self._mount_message(
+                    AppMessage(f"Failed to read {mcp_path}: {type(e).__name__}: {e}")
+                )
+                return
+
+            servers = _extract_mcp_servers(data)
+            if not servers:
+                await self._mount_message(
+                    AppMessage(
+                        f"No MCP servers configured in {mcp_path}. "
+                        "Expected either a top-level 'mcpServers'/'servers' object or a simplified server map."
+                    )
+                )
+                return
+
+            lines = [f"Configured MCP servers (from {mcp_path}):", ""]
+            for name in sorted(servers.keys()):
+                cfg = servers.get(name)
+                if isinstance(cfg, dict):
+                    server_type = cfg.get("type")
+                    url = cfg.get("url")
+                    command_val = cfg.get("command")
+                    args_val = cfg.get("args")
+                    detail = ""
+                    if url:
+                        detail = str(url)
+                    elif command_val:
+                        detail = str(command_val)
+                        if isinstance(args_val, list) and args_val:
+                            detail += " " + " ".join(str(a) for a in args_val)
+                    if server_type:
+                        lines.append(f"  - {name} ({server_type}): {detail}".rstrip())
+                    else:
+                        lines.append(f"  - {name}: {detail}".rstrip())
+                else:
+                    lines.append(f"  - {name}: {cfg!r}")
+
+            lines.append("")
+            lines.append(
+                "Note: MCP servers from .mcp.json are attached as chat tools at startup (if reachable). "
+                "Tool names are namespaced as 'server__tool'."
+            )
+            await self._mount_message(AppMessage("\n".join(lines)))
         elif cmd == "/remember" or cmd.startswith("/remember "):
             # Extract any additional context after /remember
             additional_context = ""
@@ -2052,6 +2289,9 @@ async def run_textual_app(
     tools: list[Callable[..., Any] | dict[str, Any]] | None = None,
     sandbox: SandboxBackendProtocol | None = None,
     sandbox_type: str | None = None,
+    mcp_config_path: str | Path | None = None,
+    mcp_tool_count: int | None = None,
+    mcp_errors: list[str] | None = None,
 ) -> int:
     """Run the Textual application.
 
@@ -2083,6 +2323,9 @@ async def run_textual_app(
         tools=tools,
         sandbox=sandbox,
         sandbox_type=sandbox_type,
+        mcp_config_path=mcp_config_path,
+        mcp_tool_count=mcp_tool_count,
+        mcp_errors=mcp_errors,
     )
     await app.run_async()
     return app.return_code or 0
