@@ -455,6 +455,7 @@ class Settings:
 
     # API keys
     openai_api_key: str | None
+    openai_base_url: str | None
     anthropic_api_key: str | None
     google_api_key: str | None
     tavily_api_key: str | None
@@ -501,6 +502,9 @@ class Settings:
         """
         # Detect API keys
         openai_key = os.environ.get("OPENAI_API_KEY")
+        openai_base_url = os.environ.get("OPENAI_BASE_URL") or os.environ.get(
+            "OPENAI_API_BASE"
+        )
         anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
         google_key = os.environ.get("GOOGLE_API_KEY")
         tavily_key = os.environ.get("TAVILY_API_KEY")
@@ -537,6 +541,7 @@ class Settings:
 
         return cls(
             openai_api_key=openai_key,
+            openai_base_url=openai_base_url,
             anthropic_api_key=anthropic_key,
             google_api_key=google_key,
             tavily_api_key=tavily_key,
@@ -1488,6 +1493,11 @@ def create_model(
         provider_for_init = "openai"
         kwargs.setdefault("base_url", settings.ollama_base_url)
         kwargs.setdefault("api_key", "local")
+    elif provider == "openai":
+        if settings.openai_api_key:
+            kwargs.setdefault("api_key", settings.openai_api_key)
+        if settings.openai_base_url:
+            kwargs.setdefault("base_url", settings.openai_base_url)
     elif provider == "azure_openai":
         if settings.azure_openai_api_key:
             kwargs.setdefault("api_key", settings.azure_openai_api_key)
