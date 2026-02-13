@@ -32,7 +32,7 @@ In the interactive UI, run `/model` to see which providers are configured from y
 If you have an OpenAI-compatible endpoint (e.g., a corporate gateway or proxy) you can point the OpenAI provider at it by setting `OPENAI_BASE_URL` (or `OPENAI_API_BASE`) and `OPENAI_API_KEY`.
 
 ```bash
-export OPENAI_BASE_URL="https://openai.generative.engine.capgemini.com/v1"
+export OPENAI_BASE_URL="https://openai.generative.engine.xxxxxxxxx.com/v1"
 export OPENAI_API_KEY="..."
 
 deepagents-custom --model openai:amazon.nova-lite-v1:0
