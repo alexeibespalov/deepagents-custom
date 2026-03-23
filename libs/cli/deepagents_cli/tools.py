@@ -109,8 +109,9 @@ def web_search(  # noqa: ANN201  # Return type depends on dynamic tool configura
 ):
     """Search the web using Tavily for current information and documentation.
 
-    This tool searches the web and returns relevant results. After receiving results,
-    you MUST synthesize the information into a natural, helpful response for the user.
+    This tool searches the web and returns a formatted list of results ready to use.
+    Synthesize the information into a natural, helpful response — do NOT repeat the
+    raw result block verbatim to the user.
 
     Args:
         query: The search query (be specific and detailed)
@@ -119,20 +120,7 @@ def web_search(  # noqa: ANN201  # Return type depends on dynamic tool configura
         include_raw_content: Include full page content (warning: uses more tokens)
 
     Returns:
-        Dictionary containing:
-        - results: List of search results, each with:
-            - title: Page title
-            - url: Page URL
-            - content: Relevant excerpt from the page
-            - score: Relevance score (0-1)
-        - query: The original search query
-
-    IMPORTANT: After using this tool:
-    1. Read through the 'content' field of each result
-    2. Extract relevant information that answers the user's question
-    3. Synthesize this into a clear, natural language response
-    4. Cite sources by mentioning the page titles or URLs
-    5. NEVER show the raw JSON to the user - always provide a formatted response
+        A formatted string listing each result with title, URL, and content excerpt.
     """
     try:
         import requests
@@ -144,22 +132,20 @@ def web_search(  # noqa: ANN201  # Return type depends on dynamic tool configura
         )
         from tavily.errors import ForbiddenError, TimeoutError as TavilyTimeoutError
     except ImportError as exc:
-        return {
-            "error": f"Required package not installed: {exc.name}. "
-            "Install with: pip install 'deepagents[cli]'",
-            "query": query,
-        }
+        return (
+            f"Web search error: Required package not installed: {exc.name}. "
+            "Install with: pip install 'deepagents[cli]'"
+        )
 
     client = _get_tavily_client()
     if client is None:
-        return {
-            "error": "Tavily API key not configured. "
-            "Please set TAVILY_API_KEY environment variable.",
-            "query": query,
-        }
+        return (
+            "Web search error: Tavily API key not configured. "
+            "Please set TAVILY_API_KEY environment variable."
+        )
 
     try:
-        return client.search(
+        raw = client.search(
             query,
             max_results=max_results,
             include_raw_content=include_raw_content,
@@ -177,7 +163,26 @@ def web_search(  # noqa: ANN201  # Return type depends on dynamic tool configura
         TavilyTimeoutError,
         UsageLimitExceededError,
     ) as e:
-        return {"error": f"Web search error: {e!s}", "query": query}
+        return f"Web search error: {e!s}"
+
+    results = raw.get("results") or []
+    if not results:
+        return f"No results found for query: {query}"
+
+    lines = [f"Search results for: {query}\n"]
+    for i, r in enumerate(results, 1):
+        title = r.get("title", "Untitled")
+        url = r.get("url", "")
+        content = r.get("content", "").strip()
+        raw_content = r.get("raw_content", "")
+        lines.append(f"[{i}] {title}")
+        lines.append(f"    URL: {url}")
+        lines.append(f"    {content}")
+        if raw_content:
+            lines.append(f"    Full content: {raw_content.strip()[:2000]}")
+        lines.append("")
+
+    return "\n".join(lines)
 
 
 def fetch_url(url: str, timeout: int = 30) -> dict[str, Any]:

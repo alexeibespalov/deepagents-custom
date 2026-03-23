@@ -952,7 +952,8 @@ def apply_stdin_pipe(args: argparse.Namespace) -> None:
     # Textual's driver reads from file descriptor 0 directly (not sys.stdin),
     # so we must replace the underlying fd with /dev/tty using os.dup2.
     try:
-        tty_fd = os.open("/dev/tty", os.O_RDONLY)
+        tty_path = "CONIN$" if sys.platform == "win32" else "/dev/tty"
+        tty_fd = os.open(tty_path, os.O_RDONLY)
     except OSError:
         # No controlling terminal (CI, Docker, headless). Non-interactive
         # path still works; interactive -m path will fail later with a

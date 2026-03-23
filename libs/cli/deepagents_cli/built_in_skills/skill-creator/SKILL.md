@@ -218,7 +218,7 @@ Skill creation involves these steps:
 
 1. Understand the skill with concrete examples
 2. Plan reusable skill contents (scripts, references, assets)
-3. Initialize the skill (run init_skill.py)
+3. Initialize the skill (use `create_skill` tool)
 4. Edit the skill (implement resources and write SKILL.md)
 5. Validate the skill (run quick_validate.py)
 6. Iterate based on real usage
@@ -272,50 +272,23 @@ At this point, it is time to actually create the skill.
 
 Skip this step only if the skill being developed already exists, and iteration or packaging is needed. In this case, continue to the next step.
 
-There are two ways to create a new skill:
+> ⚠️ **CRITICAL**: Always use the `create_skill` tool to create skills. Do NOT use `write_file`, `edit_file`, or the shell scripts below — they write into the agent's sandbox and the file will not be discoverable.
 
-#### Option A: `init_skill.py` (recommended for rich skills)
+#### Using the `create_skill` tool (required)
 
-When creating a new skill from scratch, run the `init_skill.py` script. The script generates a new template skill directory that automatically includes everything a skill requires, making the skill creation process much more efficient and reliable.
-
-Usage:
-
-```bash
-scripts/init_skill.py <skill-name> --path <output-directory>
+```
+create_skill(
+    skill_name="<kebab-case-name>",
+    description="<one-sentence description of when to use this skill>",
+    body="<full Markdown body of SKILL.md>"
+)
 ```
 
-For deepagents CLI, use any of the skill directories listed in "Skill Location for Deepagents" above:
+This tool writes directly to `.deepagents/skills/<skill-name>/SKILL.md` in the **real** project directory, bypassing the sandbox. The skill will appear in the Discovery panel within seconds.
 
-```bash
-# User skills (default)
-scripts/init_skill.py <skill-name> --path ~/.deepagents/agent/skills
+After creation, you can use `edit_file` or write additional files (scripts, references, assets) **using relative paths from the project root**, e.g. `.deepagents/skills/<skill-name>/scripts/my_script.py`.
 
-# Project skills
-scripts/init_skill.py <skill-name> --path .deepagents/skills
-```
-
-The script:
-
-- Creates the skill directory at the specified path
-- Generates a SKILL.md template with proper frontmatter and TODO placeholders
-- Creates example resource directories: `scripts/`, `references/`, and `assets/`
-- Adds example files in each directory that can be customized or deleted
-
-After initialization, customize or remove the generated SKILL.md and example files as needed.
-
-#### Option B: `deepagents skills create` (quick start)
-
-The built-in CLI command creates a minimal skill with just a `SKILL.md` template — no resource directories. Use this for simple skills that only need instructions and no bundled scripts, references, or assets.
-
-```bash
-# Create in user skills directory
-deepagents skills create <skill-name>
-
-# Create in project skills directory
-deepagents skills create <skill-name> --project
-```
-
-Use `init_skill.py` when the skill will include bundled resources (`scripts/`, `references/`, `assets/`). Use `deepagents skills create` for a quick, minimal starting point.
+> **Note**: The legacy `init_skill.py` script and `deepagents skills create` CLI command write to paths that are intercepted by the agent sandbox. Do not use them.
 
 ### Step 4: Edit the Skill
 

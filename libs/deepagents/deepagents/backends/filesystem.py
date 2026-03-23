@@ -35,6 +35,16 @@ from deepagents.backends.utils import (
 logger = logging.getLogger(__name__)
 
 
+def _fwd(p: object) -> str:
+    """Convert a Path or string to a forward-slash string.
+
+    On Windows ``str(Path(...))`` produces backslash separators which break
+    prefix matching and pollute paths returned to the LLM.  This helper
+    normalises every path to forward slashes before it leaves the backend.
+    """
+    return str(p).replace("\\", "/")
+
+
 class FilesystemBackend(BackendProtocol):
     """Backend that reads and writes files directly from the filesystem.
 
@@ -208,8 +218,8 @@ class FilesystemBackend(BackendProtocol):
 
         results: list[FileInfo] = []
 
-        # Convert cwd to string for comparison
-        cwd_str = str(self.cwd)
+        # Convert cwd to forward-slash string for reliable prefix stripping
+        cwd_str = _fwd(self.cwd)
         if not cwd_str.endswith("/"):
             cwd_str += "/"
 
@@ -222,7 +232,7 @@ class FilesystemBackend(BackendProtocol):
                 except OSError:
                     continue
 
-                abs_path = str(child_path)
+                abs_path = _fwd(child_path)
 
                 if not self.virtual_mode:
                     # Non-virtual mode: use absolute paths

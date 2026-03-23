@@ -302,7 +302,7 @@ async def list_threads(
         query = f"""
             SELECT thread_id,
                    json_extract(metadata, '$.agent_name') as agent_name,
-                   MAX(json_extract(metadata, '$.updated_at')) as updated_at,
+                   COALESCE(MAX(json_extract(metadata, '$.updated_at')), MAX(checkpoint_id)) as updated_at,
                    MAX(checkpoint_id) as latest_checkpoint_id,
                    MIN(json_extract(metadata, '$.updated_at')) as created_at,
                    MAX(json_extract(metadata, '$.git_branch')) as git_branch,

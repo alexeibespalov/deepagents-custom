@@ -25,7 +25,8 @@ def _copy_osc52(text: str) -> None:
     if os.environ.get("TMUX"):
         osc52_seq = f"\033Ptmux;\033{osc52_seq}\033\\"
 
-    with pathlib.Path("/dev/tty").open("w", encoding="utf-8") as tty:
+    tty_path = "CONOUT$" if os.name == "nt" else "/dev/tty"
+    with pathlib.Path(tty_path).open("w", encoding="utf-8") as tty:
         tty.write(osc52_seq)
         tty.flush()
 

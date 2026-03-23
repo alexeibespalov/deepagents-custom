@@ -191,6 +191,9 @@ class SkillMetadata(TypedDict):
     - Space-delimited list of tool names
     """
 
+    body: str
+    """Full body of the SKILL.md file (everything after the YAML frontmatter)."""
+
 
 class SkillsState(AgentState):
     """State for the skills middleware."""
@@ -271,7 +274,7 @@ def _parse_skill_metadata(  # noqa: C901
         return None
 
     # Match YAML frontmatter between --- delimiters
-    frontmatter_pattern = r"^---\s*\n(.*?)\n---\s*\n"
+    frontmatter_pattern = r"^---\s*\n(.*?)\n---\s*\n(.*)"
     match = re.match(frontmatter_pattern, content, re.DOTALL)
 
     if not match:
@@ -279,6 +282,7 @@ def _parse_skill_metadata(  # noqa: C901
         return None
 
     frontmatter_str = match.group(1)
+    body_str = match.group(2).strip()
 
     # Parse YAML using safe_load for proper nested structure support
     try:
@@ -349,6 +353,7 @@ def _parse_skill_metadata(  # noqa: C901
         license=str(frontmatter_data.get("license", "")).strip() or None,
         compatibility=compatibility_str,
         allowed_tools=allowed_tools,
+        body=body_str,
     )
 
 
@@ -559,43 +564,13 @@ async def _alist_skills(backend: BackendProtocol, source_path: str) -> list[Skil
 
 SKILLS_SYSTEM_PROMPT = """
 
-## Skills System
+## Skills
 
-You have access to a skills library that provides specialized capabilities and domain knowledge.
+The following skills are available to you. Their full instructions are included below — follow them whenever the user's request matches a skill's domain.
 
 {skills_locations}
 
-**Available Skills:**
-
 {skills_list}
-
-**How to Use Skills (Progressive Disclosure):**
-
-Skills follow a **progressive disclosure** pattern - you see their name and description above, but only read full instructions when needed:
-
-1. **Recognize when a skill applies**: Check if the user's task matches a skill's description
-2. **Read the skill's full instructions**: Use the path shown in the skill list above
-3. **Follow the skill's instructions**: SKILL.md contains step-by-step workflows, best practices, and examples
-4. **Access supporting files**: Skills may include helper scripts, configs, or reference docs - use absolute paths
-
-**When to Use Skills:**
-- User's request matches a skill's domain (e.g., "research X" -> web-research skill)
-- You need specialized knowledge or structured workflows
-- A skill provides proven patterns for complex tasks
-
-**Executing Skill Scripts:**
-Skills may contain Python scripts or other executable files. Always use absolute paths from the skill list.
-
-**Example Workflow:**
-
-User: "Can you research the latest developments in quantum computing?"
-
-1. Check available skills -> See "web-research" skill with its path
-2. Read the skill using the path shown
-3. Follow the skill's research workflow (search -> organize -> synthesize)
-4. Use any helper scripts with absolute paths
-
-Remember: Skills make you more capable and consistent. When in doubt, check if a skill exists for the task!
 """
 
 
@@ -695,15 +670,15 @@ class SkillsMiddleware(AgentMiddleware[SkillsState, ContextT, ResponseT]):
         lines = []
         for skill in skills:
             annotations = _format_skill_annotations(skill)
-            desc_line = f"- **{skill['name']}**: {skill['description']}"
+            header = f"### Skill: {skill['name']}"
             if annotations:
-                desc_line += f" ({annotations})"
-            lines.append(desc_line)
+                header += f" ({annotations})"
+            lines.append(header)
             if skill["allowed_tools"]:
-                lines.append(f"  -> Allowed tools: {', '.join(skill['allowed_tools'])}")
-            lines.append(f"  -> Read `{skill['path']}` for full instructions")
+                lines.append(f"Allowed tools: {', '.join(skill['allowed_tools'])}")
+            lines.append(skill.get("body") or f"_{skill['description']}_")
 
-        return "\n".join(lines)
+        return "\n\n".join(lines)
 
     def modify_request(self, request: ModelRequest[ContextT]) -> ModelRequest[ContextT]:
         """Inject skills documentation into a model request's system message.

@@ -304,6 +304,44 @@ class _DeepAgentsSummarizationMiddleware(AgentMiddleware):
         """Retrieve max input token limit from the model profile."""
         return self._lc_helper._get_profile_limits()
 
+    def _inject_context_budget(
+        self,
+        request: "ModelRequest",
+        total_tokens: int,
+    ) -> "ModelRequest":
+        """Append a context-budget annotation to the system message.
+
+        Gives the agent visibility into how much of its context window has been
+        consumed so it can self-regulate (e.g. switch to cursor/state files
+        instead of re-reading large content each turn).
+        """
+        max_tokens = self._get_profile_limits()
+        if max_tokens is None or max_tokens <= 0:
+            return request
+
+        pct = total_tokens / max_tokens
+        budget = (
+            f"\n\n[Context budget: {pct:.0%} used \u2014 {total_tokens:,} / {max_tokens:,} tokens. "
+            f"Summarization triggers at 85%.]"
+        )
+        if pct > 0.60:
+            budget += (
+                "\n\u26a0 Context pressure is HIGH. Prefer tiny cursor/state files over "
+                "re-reading large content. Keep tool-call payloads minimal."
+            )
+
+        if request.system_message is not None:
+            existing = request.system_message.content
+            if isinstance(existing, list):
+                # Content is a list of content blocks; append budget as a text block.
+                new_sys = SystemMessage(content=existing + [{"type": "text", "text": budget}])
+            else:
+                new_sys = SystemMessage(content=existing + budget)
+        else:
+            new_sys = SystemMessage(content=budget.lstrip())
+
+        return request.override(system_message=new_sys)
+
     def _should_summarize(self, messages: list[AnyMessage], total_tokens: int) -> bool:
         """Determine whether summarization should run for the current token usage."""
         return self._lc_helper._should_summarize(messages, total_tokens)
@@ -912,6 +950,10 @@ A condensed summary follows:
             total_tokens = self.token_counter(counted_messages, tools=request.tools)  # ty: ignore[unknown-argument]
         except TypeError:
             total_tokens = self.token_counter(counted_messages)
+
+        # Inject context budget into system message so the agent can self-regulate
+        request = self._inject_context_budget(request, total_tokens)
+
         should_summarize = self._should_summarize(truncated_messages, total_tokens)
 
         # If no summarization needed, return with truncated messages
@@ -1016,6 +1058,10 @@ A condensed summary follows:
             total_tokens = self.token_counter(counted_messages, tools=request.tools)  # ty: ignore[unknown-argument]
         except TypeError:
             total_tokens = self.token_counter(counted_messages)
+
+        # Inject context budget into system message so the agent can self-regulate
+        request = self._inject_context_budget(request, total_tokens)
+
         should_summarize = self._should_summarize(truncated_messages, total_tokens)
 
         # If no summarization needed, return with truncated messages

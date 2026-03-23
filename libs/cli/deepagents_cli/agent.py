@@ -311,6 +311,7 @@ def get_system_prompt(
     *,
     interactive: bool = True,
     cwd: str | Path | None = None,
+    custom_instructions: str | None = None,
 ) -> str:
     """Get the base system prompt for the agent.
 
@@ -327,6 +328,8 @@ def get_system_prompt(
         interactive: When `False`, the prompt is tailored for headless
             non-interactive execution (no human in the loop).
         cwd: Override the working directory shown in the prompt.
+        custom_instructions: Optional user-provided instructions appended
+            to the system prompt (e.g. project-specific guidelines).
 
     Returns:
         The system prompt string
@@ -436,6 +439,9 @@ def get_system_prompt(
     unreplaced = re.findall(r"\{[a-z_]+\}", result)
     if unreplaced:
         logger.warning("System prompt contains unreplaced placeholders: %s", unreplaced)
+
+    if custom_instructions:
+        result += f"\n\n---\n\n### Custom System Prompt / Specialized Instructions\n\n{custom_instructions}"
 
     return result
 
@@ -670,6 +676,7 @@ def create_cli_agent(
     sandbox: SandboxBackendProtocol | None = None,
     sandbox_type: str | None = None,
     system_prompt: str | None = None,
+    custom_instructions: str | None = None,
     interactive: bool = True,
     auto_approve: bool = False,
     enable_ask_user: bool = True,
@@ -893,6 +900,7 @@ def create_cli_agent(
             sandbox_type=sandbox_type,
             interactive=interactive,
             cwd=effective_cwd,
+            custom_instructions=custom_instructions,
         )
 
     # Configure interrupt_on based on auto_approve setting
