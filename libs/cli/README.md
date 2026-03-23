@@ -5,11 +5,6 @@
 [![PyPI - Downloads](https://img.shields.io/pepy/dt/deepagents-cli)](https://pypistats.org/packages/deepagents-cli)
 [![Twitter](https://img.shields.io/twitter/url/https/twitter.com/langchain.svg?style=social&label=Follow%20%40LangChain)](https://x.com/langchain)
 
-Looking for the JS/TS version? Check out [Deep Agents CLI.js](https://github.com/langchain-ai/deepagentsjs).
-
-To help you ship LangChain apps to production faster, check out [LangSmith](https://smith.langchain.com).
-LangSmith is a unified developer platform for building, testing, and monitoring LLM applications.
-
 <p align="center">
   <img src="https://raw.githubusercontent.com/langchain-ai/deepagents/main/libs/cli/images/cli.png" alt="Deep Agents CLI" width="600"/>
 </p>
@@ -17,120 +12,48 @@ LangSmith is a unified developer platform for building, testing, and monitoring 
 ## Quick Install
 
 ```bash
-uv tool install deepagents-cli
-deepagents-custom
+curl -LsSf https://raw.githubusercontent.com/langchain-ai/deepagents/main/libs/cli/scripts/install.sh | bash
 ```
-
-## Model providers
-
-The CLI supports selecting a model with `--model`. You can either let the CLI auto-detect the provider from the model name (e.g., `gpt-*`, `claude-*`, `gemini-*`), or specify it explicitly as `provider:model`.
-
-In the interactive UI, run `/model` to see which providers are configured from your environment.
-
-### OpenAI-compatible gateway (custom base URL)
-
-If you have an OpenAI-compatible endpoint (e.g., a corporate gateway or proxy) you can point the OpenAI provider at it by setting `OPENAI_BASE_URL` (or `OPENAI_API_BASE`) and `OPENAI_API_KEY`.
 
 ```bash
-export OPENAI_BASE_URL="https://openai.generative.engine.xxxxxxxxx.com/v1"
-export OPENAI_API_KEY="..."
-
-deepagents-custom --model openai:amazon.nova-lite-v1:0
+# With model provider extras
+DEEPAGENTS_EXTRAS="nvidia,ollama" curl -LsSf https://raw.githubusercontent.com/langchain-ai/deepagents/main/libs/cli/scripts/install.sh | bash
 ```
 
-### Ollama (local)
-
-Uses Ollama's OpenAI-compatible server.
+Or install directly with `uv`:
 
 ```bash
-export OLLAMA_BASE_URL="http://localhost:11434/v1"
-export OLLAMA_MODEL="llama3"
-
-deepagents-custom --model ollama:llama3
+# Install with chosen model providers
+uv tool install 'deepagents-cli[nvidia,ollama]'
 ```
 
-### LM Studio (local)
-
-Uses LM Studio's OpenAI-compatible server.
+Run the CLI:
 
 ```bash
-export LMSTUDIO_BASE_URL="http://localhost:1234/v1"
-export LMSTUDIO_MODEL="your-model"
-
-deepagents-custom --model lmstudio:your-model
+deepagents
 ```
-
-### Azure OpenAI (custom domain supported)
-
-Provide a full endpoint URL (including custom domains) and your deployment name.
-
-```bash
-export AZURE_OPENAI_ENDPOINT="https://ai.mycorp.com/"
-export AZURE_OPENAI_API_KEY="..."
-export AZURE_OPENAI_API_VERSION="2024-10-21"
-export AZURE_OPENAI_DEPLOYMENT="my-deployment"
-
-deepagents-custom --model azure:my-deployment
-```
-
-## MCP servers
-
-The CLI can load tool servers from a `.mcp.json` file (searched upward from your current working directory). MCP tools appear in `/tools` namespaced as `{server}__{tool}`.
-
-### Example `.mcp.json`
-
-```json
-{
-  "mcpServers": {
-    "tavily-remote-mcp": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "mcp-remote",
-        "https://mcp.tavily.com/mcp/?tavilyApiKey=REDACTED"
-      ]
-    }
-  }
-}
-```
-
-### TLS troubleshooting (corporate proxies)
-
-If you see `UNABLE_TO_GET_ISSUER_CERT_LOCALLY` from Node-based MCP wrappers (for example `mcp-remote`), you're usually behind a TLS-intercepting proxy that is trusted by macOS Keychain but not by Node.
-
-Fix by using the system CA store:
-
-```json
-{
-  "mcpServers": {
-    "tavily-remote-mcp": {
-      "command": "npx",
-      "args": ["-y", "mcp-remote", "https://mcp.tavily.com/mcp/?tavilyApiKey=REDACTED"],
-      "env": {
-        "NODE_OPTIONS": "--use-system-ca"
-      }
-    }
-  }
-}
-```
-
-If `--use-system-ca` doesn't work in your environment, export your corporate root CA certificate as a PEM file and set `NODE_EXTRA_CA_CERTS` to point to it.
 
 ## 🤔 What is this?
 
-Using an LLM to call tools in a loop is the simplest form of an agent. This architecture, however, can yield agents that are "shallow" and fail to plan and act over longer, more complex tasks.
+The fastest way to start using Deep Agents. `deepagents-cli` is a pre-built coding agent in your terminal — similar to Claude Code or Cursor — powered by any LLM that supports tool calling. One install command and you're up and running, no code required.
 
-Applications like "Deep Research", "Manus", and "Claude Code" have gotten around this limitation by implementing a combination of four things: a **planning tool**, **sub agents**, access to a **file system**, and a **detailed prompt**.
+**What the CLI adds on top of the SDK:**
 
-`deepagents` is a Python package that implements these in a general purpose way so that you can easily create a Deep Agent for your application. For a full overview and quickstart of Deep Agents, the best resource is our [docs](https://docs.langchain.com/oss/python/deepagents/overview).
-
-**Acknowledgements: This project was primarily inspired by Claude Code, and initially was largely an attempt to see what made Claude Code general purpose, and make it even more so.**
+- **Interactive TUI** — rich terminal interface with streaming responses
+- **Conversation resume** — pick up where you left off across sessions
+- **Web search** — ground responses in live information
+- **Remote sandboxes** — run code in isolated environments (LangSmith, AgentCore, Daytona, Modal, Runloop, & more)
+- **Persistent memory** — agent remembers context across conversations
+- **Custom skills** — extend the agent with your own slash commands
+- **Headless mode** — run non-interactively for scripting and CI
+- **Human-in-the-loop** — approve or reject tool calls before execution
 
 ## 📖 Resources
 
-- **[Documentation](https://docs.langchain.com/oss/python/deepagents/cli)** — Full documentation
-- **[Deep Agents](https://github.com/langchain-ai/deepagents)** — The underlying agent harness
-- **[Chat LangChain](https://chat.langchain.com)** - Chat interactively with the docs
+- **[CLI Documentation](https://docs.langchain.com/oss/python/deepagents/cli/overview)**
+- **[Changelog](https://github.com/langchain-ai/deepagents/blob/main/libs/cli/CHANGELOG.md)**
+- **[Source code](https://github.com/langchain-ai/deepagents/tree/main/libs/cli)**
+- **[Deep Agents SDK](https://github.com/langchain-ai/deepagents)** — underlying agent harness
 
 ## 📕 Releases & Versioning
 
@@ -141,3 +64,7 @@ See our [Releases](https://docs.langchain.com/oss/python/release-policy) and [Ve
 As an open-source project in a rapidly developing field, we are extremely open to contributions, whether it be in the form of a new feature, improved infrastructure, or better documentation.
 
 For detailed information on how to contribute, see the [Contributing Guide](https://docs.langchain.com/oss/python/contributing/overview).
+
+## 🤝 Acknowledgements
+
+This project was primarily inspired by Claude Code, and initially was largely an attempt to see what made Claude Code general purpose, and make it even more so.

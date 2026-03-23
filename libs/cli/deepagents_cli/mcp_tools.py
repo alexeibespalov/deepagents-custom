@@ -1,277 +1,709 @@
-"""MCP server integration for the Deep Agents CLI.
+"""MCP (Model Context Protocol) tools loader for deepagents CLI.
 
-This module loads MCP server definitions from `.mcp.json`, connects to those
-servers, and exposes each MCP tool as a LangChain `StructuredTool` so it can be
-used by the deep agent.
-
-We intentionally keep this isolated from the Textual UI so both interactive and
-non-interactive entrypoints can reuse it.
+This module provides async functions to load and manage MCP servers using
+`langchain-mcp-adapters`, supporting Claude Desktop style JSON configs.
+It also supports automatic discovery of `.mcp.json` files from user-level
+and project-level locations.
 """
 
 from __future__ import annotations
 
 import json
-import shlex
-from collections.abc import AsyncIterator
-from contextlib import AsyncExitStack, asynccontextmanager
-from dataclasses import dataclass
+import logging
+import os
+import shutil
+from contextlib import AsyncExitStack
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from langchain_core.tools.base import ToolException
-from langchain_core.tools.structured import StructuredTool
+if TYPE_CHECKING:
+    from langchain_core.tools import BaseTool
+    from langchain_mcp_adapters.client import Connection, MultiServerMCPClient
 
+    from deepagents_cli.project_utils import ProjectContext
 
-@dataclass(frozen=True, slots=True)
-class McpToolset:
-    """Connected MCP toolset for the duration of a CLI session."""
-
-    tools: list[StructuredTool]
-    config_path: Path | None
-    errors: list[str]
+logger = logging.getLogger(__name__)
 
 
-def find_mcp_config_path(start_path: Path) -> Path | None:
-    """Search upward from `start_path` for `.mcp.json`.
+@dataclass
+class MCPToolInfo:
+    """Metadata for a single MCP tool."""
+
+    name: str
+    """Tool name (may include server name prefix)."""
+
+    description: str
+    """Human-readable description of what the tool does."""
+
+
+@dataclass
+class MCPServerInfo:
+    """Metadata for a connected MCP server and its tools."""
+
+    name: str
+    """Server name from the MCP configuration."""
+
+    transport: str
+    """Transport type (`stdio`, `sse`, or `http`)."""
+
+    tools: list[MCPToolInfo] = field(default_factory=list)
+    """Tools exposed by this server."""
+
+
+_SUPPORTED_REMOTE_TYPES = {"sse", "http"}
+"""Supported transport types for remote MCP servers (SSE and HTTP)."""
+
+
+def _resolve_server_type(server_config: dict[str, Any]) -> str:
+    """Determine the transport type for a server config.
+
+    Supports both `type` and `transport` field names, defaulting to `stdio`.
 
     Args:
-        start_path: Directory to start searching from.
+        server_config: Server configuration dictionary.
 
     Returns:
-        Path to the nearest `.mcp.json`, or `None` if not found.
+        Transport type string (`stdio`, `sse`, or `http`).
     """
-
-    start = start_path.resolve()
-    for candidate_dir in (start, *start.parents):
-        candidate = candidate_dir / ".mcp.json"
-        if candidate.exists():
-            return candidate
-    return None
+    t = server_config.get("type")
+    if t is not None:
+        return t
+    return server_config.get("transport", "stdio")
 
 
-def extract_mcp_servers(data: object) -> dict[str, object]:
-    """Extract MCP server definitions from supported config formats.
-
-    Supports:
-    - `{ "mcpServers": { ... } }`
-    - `{ "servers": { ... } }`
-    - simplified root map: `{ "server": { ... }, ... }`
-    """
-    if not isinstance(data, dict):
-        return {}
-
-    servers = data.get("mcpServers")
-    if isinstance(servers, dict):
-        return servers  # type: ignore[return-value]
-
-    servers = data.get("servers")
-    if isinstance(servers, dict):
-        return servers  # type: ignore[return-value]
-
-    meta_keys = {"$schema", "version", "inputs", "env"}
-    candidate: dict[str, object] = {
-        k: v for k, v in data.items() if isinstance(k, str) and k not in meta_keys
-    }
-    if not candidate or not all(isinstance(v, dict) for v in candidate.values()):
-        return {}
-
-    def _looks_like_server(cfg: dict[str, object]) -> bool:
-        return any(key in cfg for key in ("command", "url", "type"))
-
-    if all(_looks_like_server(v) for v in candidate.values() if isinstance(v, dict)):
-        return candidate
-
-    return {}
-
-
-def _format_call_tool_result(result: Any) -> str:
-    """Convert an MCP `CallToolResult` into a human-readable string."""
-    # We intentionally avoid importing mcp.types at module import time in case
-    # the dependency graph changes; we rely on duck-typing.
-    structured = getattr(result, "structuredContent", None)
-    if structured is not None:
-        return json.dumps(structured, indent=2, ensure_ascii=False)
-
-    content = getattr(result, "content", None)
-    if not content:
-        return ""
-
-    parts: list[str] = []
-    for block in content:
-        block_type = getattr(block, "type", None)
-        if block_type == "text":
-            parts.append(str(getattr(block, "text", "")))
-        else:
-            # Fall back to a best-effort JSON-ish representation.
-            if hasattr(block, "model_dump_json"):
-                parts.append(block.model_dump_json())
-            else:
-                parts.append(repr(block))
-    return "\n".join(p for p in parts if p)
-
-
-def _normalize_stdio_command(raw_command: object, raw_args: object) -> tuple[str, list[str]]:
-    """Normalize stdio `command` + `args`.
-
-    Some configs put everything in `command` (shell-like string). We accept
-    that for convenience but normalize to `command` executable + `args` list.
-    """
-    command = raw_command if isinstance(raw_command, str) else ""
-    args = raw_args if isinstance(raw_args, list) else []
-    args = [str(a) for a in args]
-
-    if command and args:
-        return command, args
-
-    if command and not args and any(ch.isspace() for ch in command):
-        split = shlex.split(command)
-        if split:
-            return split[0], split[1:]
-
-    return command, args
-
-
-@asynccontextmanager
-async def open_mcp_toolset(start_path: Path) -> AsyncIterator[McpToolset]:
-    """Open MCP servers from `.mcp.json` and expose tools for the agent.
+def _validate_server_config(server_name: str, server_config: dict[str, Any]) -> None:
+    """Validate a single server configuration.
 
     Args:
-        start_path: Directory to search upward from for `.mcp.json`.
+        server_name: Name of the server.
+        server_config: Server configuration dictionary.
 
-    Yields:
-        `McpToolset` containing LangChain tools and any load errors.
+    Raises:
+        TypeError: If config fields have wrong types.
+        ValueError: If required fields are missing or server type is unsupported.
     """
-    config_path = find_mcp_config_path(start_path)
-    if not config_path:
-        yield McpToolset(tools=[], config_path=None, errors=[])
-        return
+    if not isinstance(server_config, dict):
+        error_msg = f"Server '{server_name}' config must be a dictionary"
+        raise TypeError(error_msg)
 
-    errors: list[str] = []
+    server_type = _resolve_server_type(server_config)
+
+    if server_type in _SUPPORTED_REMOTE_TYPES:
+        # SSE/HTTP server validation - requires url field
+        if "url" not in server_config:
+            error_msg = (
+                f"Server '{server_name}' with type '{server_type}'"
+                " missing required 'url' field"
+            )
+            raise ValueError(error_msg)
+
+        # headers is optional but must be correct type if present
+        headers = server_config.get("headers")
+        if headers is not None and not isinstance(headers, dict):
+            error_msg = f"Server '{server_name}' 'headers' must be a dictionary"
+            raise TypeError(error_msg)
+    elif server_type == "stdio":
+        # stdio server validation
+        if "command" not in server_config:
+            error_msg = f"Server '{server_name}' missing required 'command' field"
+            raise ValueError(error_msg)
+
+        # args and env are optional but must be correct type if present
+        if "args" in server_config and not isinstance(server_config["args"], list):
+            error_msg = f"Server '{server_name}' 'args' must be a list"
+            raise TypeError(error_msg)
+
+        if "env" in server_config and not isinstance(server_config["env"], dict):
+            error_msg = f"Server '{server_name}' 'env' must be a dictionary"
+            raise TypeError(error_msg)
+    else:
+        error_msg = (
+            f"Server '{server_name}' has unsupported transport type '{server_type}'. "
+            "Supported types: stdio, sse, http"
+        )
+        raise ValueError(error_msg)
+
+
+def load_mcp_config(config_path: str) -> dict[str, Any]:
+    """Load and validate MCP configuration from JSON file.
+
+    Supports multiple server types:
+
+    - stdio: Process-based servers with `command`, `args`, `env` fields (default)
+    - sse: Server-Sent Events servers with `type: "sse"`, `url`, and optional `headers`
+    - http: HTTP-based servers with `type: "http"`, `url`, and optional `headers`
+
+    Args:
+        config_path: Path to MCP JSON configuration file (Claude Desktop format).
+
+    Returns:
+        Parsed configuration dictionary.
+
+    Raises:
+        FileNotFoundError: If config file doesn't exist.
+        json.JSONDecodeError: If config file contains invalid JSON.
+        TypeError: If config fields have wrong types.
+        ValueError: If config is missing required fields.
+    """
+    path = Path(config_path)
+
+    if not path.exists():
+        error_msg = f"MCP config file not found: {config_path}"
+        raise FileNotFoundError(error_msg)
+
     try:
-        data = json.loads(config_path.read_text())
-    except Exception as e:  # noqa: BLE001
-        yield McpToolset(
-            tools=[],
-            config_path=config_path,
-            errors=[f"Failed to read {config_path}: {type(e).__name__}: {e}"],
+        with path.open(encoding="utf-8") as f:
+            config = json.load(f)
+    except json.JSONDecodeError as e:
+        error_msg = f"Invalid JSON in MCP config file: {e.msg}"
+        raise json.JSONDecodeError(error_msg, e.doc, e.pos) from e
+
+    # Validate required fields
+    if "mcpServers" not in config:
+        error_msg = (
+            "MCP config must contain 'mcpServers' field. "
+            'Expected format: {"mcpServers": {"server-name": {...}}}'
         )
-        return
+        raise ValueError(error_msg)
 
-    servers = extract_mcp_servers(data)
-    if not servers:
-        yield McpToolset(
-            tools=[],
-            config_path=config_path,
-            errors=[
-                f"No MCP servers configured in {config_path}. "
-                "Expected a top-level 'mcpServers'/'servers' object or a simplified server map."
-            ],
+    if not isinstance(config["mcpServers"], dict):
+        error_msg = "'mcpServers' field must be a dictionary"
+        raise TypeError(error_msg)
+
+    if not config["mcpServers"]:
+        error_msg = "'mcpServers' field is empty - no servers configured"
+        raise ValueError(error_msg)
+
+    # Validate each server config
+    for server_name, server_config in config["mcpServers"].items():
+        _validate_server_config(server_name, server_config)
+
+    return config
+
+
+def _resolve_project_config_base(project_context: ProjectContext | None) -> Path:
+    """Resolve the base directory for project-level MCP configuration lookup.
+
+    Args:
+        project_context: Explicit project path context, if available.
+
+    Returns:
+        Project root when one exists, otherwise the user working directory.
+    """
+    if project_context is not None:
+        return project_context.project_root or project_context.user_cwd
+
+    from deepagents_cli.project_utils import find_project_root
+
+    return find_project_root() or Path.cwd()
+
+
+def discover_mcp_configs(
+    *, project_context: ProjectContext | None = None
+) -> list[Path]:
+    """Find MCP config files from standard locations.
+
+    Checks three paths in precedence order (lowest to highest):
+
+    1. `~/.deepagents/.mcp.json` (user-level global)
+    2. `<project-root>/.deepagents/.mcp.json` (project subdir)
+    3. `<project-root>/.mcp.json` (project root, Claude Code compat)
+
+    Project root is determined from `project_context` when provided, otherwise
+    by `find_project_root()`, falling back to CWD.
+
+    Returns:
+        List of existing config file paths, ordered lowest-to-highest precedence.
+    """
+    user_dir = Path.home() / ".deepagents"
+    project_root = _resolve_project_config_base(project_context)
+
+    candidates = [
+        user_dir / ".mcp.json",
+        project_root / ".deepagents" / ".mcp.json",
+        project_root / ".mcp.json",
+    ]
+
+    found: list[Path] = []
+    for path in candidates:
+        try:
+            if path.is_file():
+                found.append(path)
+        except OSError:
+            logger.warning("Could not check MCP config %s", path, exc_info=True)
+    return found
+
+
+def classify_discovered_configs(
+    config_paths: list[Path],
+) -> tuple[list[Path], list[Path]]:
+    """Split discovered config paths into user-level and project-level.
+
+    User-level configs live under `~/.deepagents/`. Everything else is
+    considered project-level.
+
+    Args:
+        config_paths: Paths returned by `discover_mcp_configs`.
+
+    Returns:
+        Tuple of `(user_configs, project_configs)`.
+    """
+    user_dir = Path.home() / ".deepagents"
+    user: list[Path] = []
+    project: list[Path] = []
+    for path in config_paths:
+        try:
+            if path.resolve().is_relative_to(user_dir.resolve()):
+                user.append(path)
+            else:
+                project.append(path)
+        except (OSError, ValueError):
+            project.append(path)
+    return user, project
+
+
+def extract_stdio_server_commands(
+    config: dict[str, Any],
+) -> list[tuple[str, str, list[str]]]:
+    """Extract stdio server entries from a parsed MCP config.
+
+    Args:
+        config: Parsed MCP config dict with `mcpServers` key.
+
+    Returns:
+        List of `(server_name, command, args)` for each stdio server.
+    """
+    results: list[tuple[str, str, list[str]]] = []
+    servers = config.get("mcpServers", {})
+    if not isinstance(servers, dict):
+        return results
+    for name, srv in servers.items():
+        if not isinstance(srv, dict):
+            continue
+        if _resolve_server_type(srv) == "stdio":
+            results.append((name, srv.get("command", ""), srv.get("args", [])))
+    return results
+
+
+def _filter_project_stdio_servers(config: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of *config* with stdio servers removed.
+
+    Remote (SSE/HTTP) servers are kept because they don't execute local code.
+
+    Args:
+        config: Parsed MCP config dict.
+
+    Returns:
+        Filtered config dict.
+    """
+    servers = config.get("mcpServers", {})
+    if not isinstance(servers, dict):
+        return config
+    filtered = {
+        name: srv
+        for name, srv in servers.items()
+        if isinstance(srv, dict) and _resolve_server_type(srv) != "stdio"
+    }
+    return {"mcpServers": filtered}
+
+
+def merge_mcp_configs(configs: list[dict[str, Any]]) -> dict[str, Any]:
+    """Merge multiple MCP config dicts by server name.
+
+    Later entries override earlier ones for the same server name
+    (simple `dict.update` on `mcpServers`).
+
+    Args:
+        configs: Ordered list of parsed config dicts (each with `mcpServers` key).
+
+    Returns:
+        Merged config with combined `mcpServers`.
+    """
+    merged: dict[str, Any] = {}
+    for cfg in configs:
+        servers = cfg.get("mcpServers")
+        if isinstance(servers, dict):
+            merged.update(servers)
+    return {"mcpServers": merged}
+
+
+def load_mcp_config_lenient(config_path: Path) -> dict[str, Any] | None:
+    """Load an MCP config file, returning None on any error.
+
+    Wraps `load_mcp_config` with lenient error handling suitable for
+    auto-discovery. Missing files are skipped silently; parse and validation
+    errors are logged as warnings.
+
+    Args:
+        config_path: Path to the MCP config file.
+
+    Returns:
+        Parsed config dict, or None if the file is missing or invalid.
+    """
+    try:
+        return load_mcp_config(str(config_path))
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        logger.warning("Skipping unreadable MCP config %s: %s", config_path, e)
+        return None
+    except (json.JSONDecodeError, ValueError, TypeError) as e:
+        logger.warning("Skipping invalid MCP config %s: %s", config_path, e)
+        return None
+
+
+class MCPSessionManager:
+    """Manages persistent MCP sessions for stateful stdio servers.
+
+    This manager creates and maintains persistent sessions for stdio MCP
+    servers, preventing server restarts on every tool call. Sessions are kept
+    alive until explicitly cleaned up.
+    """
+
+    def __init__(self) -> None:
+        """Initialize the session manager."""
+        self.client: MultiServerMCPClient | None = None
+        self.exit_stack = AsyncExitStack()
+
+    async def cleanup(self) -> None:
+        """Clean up all managed sessions and close connections."""
+        await self.exit_stack.aclose()
+
+
+def _check_stdio_server(server_name: str, server_config: dict[str, Any]) -> None:
+    """Verify that a stdio server's command exists on PATH.
+
+    Args:
+        server_name: Name of the server (for error messages).
+        server_config: Server configuration dictionary with `command` key.
+
+    Raises:
+        RuntimeError: If the command is missing from config or not found on PATH.
+    """
+    command = server_config.get("command")
+    if command is None:
+        msg = f"MCP server '{server_name}': missing 'command' in config."
+        raise RuntimeError(msg)
+    if shutil.which(command) is None:
+        msg = (
+            f"MCP server '{server_name}': command '{command}' not found on PATH. "
+            "Install it or check your MCP config."
         )
-        return
+        raise RuntimeError(msg)
 
-    # Lazy imports: mcp is an optional-ish integration and we want fast startup.
-    from mcp.client.session import ClientSession  # noqa: PLC0415
-    from mcp.client.sse import sse_client  # noqa: PLC0415
-    from mcp.client.stdio import StdioServerParameters, stdio_client  # noqa: PLC0415
-    from mcp.client.streamable_http import streamable_http_client  # noqa: PLC0415
 
-    async with AsyncExitStack() as stack:
-        tools: list[StructuredTool] = []
+async def _check_remote_server(server_name: str, server_config: dict[str, Any]) -> None:
+    """Check network connectivity to a remote MCP server URL.
 
-        for server_name, cfg_obj in sorted(servers.items(), key=lambda kv: kv[0]):
-            if not isinstance(cfg_obj, dict):
-                errors.append(f"MCP server '{server_name}' config must be an object.")
-                continue
+    Sends a lightweight HEAD request with a 2-second timeout to detect DNS
+    failures, refused connections, and network timeouts early, before the MCP
+    session handshake. HTTP error responses (4xx, 5xx) are not treated as
+    failures — only transport errors, invalid URLs, and OS-level socket
+    errors raise.
 
-            cfg: dict[str, Any] = cfg_obj
-            server_type = cfg.get("type")
-            env = cfg.get("env")
-            env_dict = env if isinstance(env, dict) else None
+    Args:
+        server_name: Name of the server (for error messages).
+        server_config: Server configuration dictionary with `url` key.
 
-            try:
-                if "command" in cfg:
-                    command, args = _normalize_stdio_command(cfg.get("command"), cfg.get("args"))
-                    if not command:
-                        raise ValueError("Missing 'command' for stdio MCP server")
-                    params = StdioServerParameters(
-                        command=command,
-                        args=args,
-                        env={str(k): str(v) for k, v in (env_dict or {}).items()} or None,
-                        cwd=str(start_path),
-                    )
-                    read, write = await stack.enter_async_context(stdio_client(params))
-                elif "url" in cfg:
-                    url = cfg.get("url")
-                    if not isinstance(url, str) or not url:
-                        raise ValueError("Missing 'url' for HTTP/SSE MCP server")
+    Raises:
+        RuntimeError: If the server URL is unreachable or invalid.
+    """
+    import httpx
 
-                    headers = cfg.get("headers")
-                    headers_dict = headers if isinstance(headers, dict) else None
-                    headers_typed = (
-                        {str(k): v for k, v in headers_dict.items()} if headers_dict else None
-                    )
+    url = server_config.get("url")
+    if url is None:
+        msg = f"MCP server '{server_name}': missing 'url' in config."
+        raise RuntimeError(msg)
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.head(url, timeout=2)
+    except (httpx.TransportError, httpx.InvalidURL, OSError) as exc:
+        msg = (
+            f"MCP server '{server_name}': URL '{url}' is unreachable: {exc}. "
+            "Check that the URL is correct and the server is running."
+        )
+        raise RuntimeError(msg) from exc
 
-                    if server_type == "sse":
-                        read, write = await stack.enter_async_context(
-                            sse_client(url, headers=headers_typed)
-                        )
-                    else:
-                        # Default for `type: http` (and omitted): streamable HTTP.
-                        read, write, _get_session_id = await stack.enter_async_context(
-                            streamable_http_client(url)
-                        )
-                else:
-                    raise ValueError("Expected either 'command' or 'url' in MCP server config")
 
-                session = await stack.enter_async_context(ClientSession(read, write))
-                await session.initialize()
-                listed = await session.list_tools()
+async def _load_tools_from_config(
+    config: dict[str, Any],
+) -> tuple[list[BaseTool], MCPSessionManager, list[MCPServerInfo]]:
+    """Build MCP connections from a validated config and load tools.
 
-                for mcp_tool in listed.tools:
-                    # Always namespace to avoid collisions with built-in tools.
-                    tool_name = f"{server_name}__{mcp_tool.name}"
-                    description = mcp_tool.description or mcp_tool.title or ""
-                    if description:
-                        description = f"[MCP:{server_name}] {description}"
-                    else:
-                        description = f"[MCP:{server_name}]"
+    This is the shared implementation used by both `get_mcp_tools` (explicit
+    path) and `resolve_and_load_mcp_tools` (auto-discovery).
 
-                    input_schema = mcp_tool.inputSchema or {
-                        "type": "object",
-                        "properties": {},
-                    }
+    Args:
+        config: Validated MCP configuration dict with `mcpServers` key.
 
-                    async def _call_mcp_tool(
-                        *,
-                        _session: Any = session,
-                        _mcp_tool_name: str = mcp_tool.name,
-                        **kwargs: Any,
-                    ) -> str:
-                        result = await _session.call_tool(_mcp_tool_name, kwargs)
-                        if getattr(result, "isError", False):
-                            msg = _format_call_tool_result(result) or "MCP tool call failed"
-                            raise ToolException(msg)
-                        return _format_call_tool_result(result)
+    Returns:
+        Tuple of `(tools_list, session_manager, server_infos)`.
 
-                    tools.append(
-                        StructuredTool.from_function(
-                            coroutine=_call_mcp_tool,
-                            name=tool_name,
-                            description=description,
-                            args_schema=input_schema,
-                            metadata={
-                                "source": "mcp",
-                                "mcp_server": server_name,
-                                "mcp_tool": mcp_tool.name,
-                                "mcp_transport": "stdio" if "command" in cfg else "http",
-                            },
-                        )
-                    )
+    Raises:
+        RuntimeError: If MCP server fails to spawn or connect.
+    """
+    from langchain_mcp_adapters.client import MultiServerMCPClient
+    from langchain_mcp_adapters.sessions import (
+        SSEConnection,
+        StdioConnection,
+        StreamableHttpConnection,
+    )
+    from langchain_mcp_adapters.tools import load_mcp_tools
 
-            except Exception as e:  # noqa: BLE001
-                errors.append(
-                    f"Failed to connect MCP server '{server_name}': {type(e).__name__}: {e}"
+    # Pre-flight health checks (best-effort early detection; the session setup
+    # below has its own error handling for TOCTOU races).
+    errors: list[str] = []
+    for server_name, server_config in config["mcpServers"].items():
+        server_type = _resolve_server_type(server_config)
+        try:
+            if server_type in _SUPPORTED_REMOTE_TYPES:
+                await _check_remote_server(server_name, server_config)
+            elif server_type == "stdio":
+                _check_stdio_server(server_name, server_config)
+        except RuntimeError as exc:
+            errors.append(str(exc))
+    if errors:
+        msg = "Pre-flight health check(s) failed:\n" + "\n".join(
+            f"  - {e}" for e in errors
+        )
+        raise RuntimeError(msg)
+
+    # Create connections dict for MultiServerMCPClient
+    # Convert Claude Desktop format to langchain-mcp-adapters format
+    connections: dict[str, Connection] = {}
+    for server_name, server_config in config["mcpServers"].items():
+        server_type = _resolve_server_type(server_config)
+
+        if server_type in _SUPPORTED_REMOTE_TYPES:
+            # langchain-mcp-adapters uses "streamable_http" for HTTP transport
+            if server_type == "http":
+                conn: Connection = StreamableHttpConnection(
+                    transport="streamable_http",
+                    url=server_config["url"],
                 )
-                continue
+            else:
+                conn = SSEConnection(
+                    transport="sse",
+                    url=server_config["url"],
+                )
+            if "headers" in server_config:
+                conn["headers"] = server_config["headers"]
+            connections[server_name] = conn
+        else:
+            # stdio server connection (default)
+            raw_env = server_config.get("env")
+            connections[server_name] = StdioConnection(
+                command=server_config["command"],
+                args=server_config.get("args", []),
+                env={str(k): os.path.expandvars(str(v)) for k, v in raw_env.items()} if raw_env else None,
+                transport="stdio",
+            )
 
-        yield McpToolset(tools=tools, config_path=config_path, errors=errors)
+    # Create session manager to track persistent sessions
+    manager = MCPSessionManager()
+
+    try:
+        client = MultiServerMCPClient(connections=connections)
+        manager.client = client
+    except Exception as e:
+        await manager.cleanup()
+        error_msg = f"Failed to initialize MCP client: {e}"
+        raise RuntimeError(error_msg) from e
+
+    try:
+        all_tools: list[BaseTool] = []
+        server_infos: list[MCPServerInfo] = []
+        for server_name, server_config in config["mcpServers"].items():
+            session = await manager.exit_stack.enter_async_context(
+                client.session(server_name)
+            )
+            tools = await load_mcp_tools(
+                session, server_name=server_name, tool_name_prefix=True
+            )
+            all_tools.extend(tools)
+            server_infos.append(
+                MCPServerInfo(
+                    name=server_name,
+                    transport=_resolve_server_type(server_config),
+                    tools=[
+                        MCPToolInfo(name=t.name, description=t.description or "")
+                        for t in tools
+                    ],
+                )
+            )
+    except Exception as e:
+        await manager.cleanup()
+        error_msg = (
+            f"Failed to load tools from MCP server '{server_name}': {e}\n"
+            "For stdio servers: Check that the command and args are correct,"
+            " and that the MCP server is installed"
+            " (e.g., run 'npx -y <package>' manually to test).\n"
+            "For sse/http servers: Check that the URL is correct"
+            " and the server is running."
+        )
+        raise RuntimeError(error_msg) from e
+
+    return all_tools, manager, server_infos
+
+
+async def get_mcp_tools(
+    config_path: str,
+) -> tuple[list[BaseTool], MCPSessionManager, list[MCPServerInfo]]:
+    """Load MCP tools from configuration file with stateful sessions.
+
+    Supports multiple server types:
+    - stdio: Spawns MCP servers as subprocesses with persistent sessions
+    - sse/http: Connects to remote MCP servers via URL
+
+    For stdio servers, this creates persistent sessions that remain active
+    across tool calls, avoiding server restarts. Sessions are managed by
+    `MCPSessionManager` and should be cleaned up with
+    `session_manager.cleanup()` when done.
+
+    Args:
+        config_path: Path to MCP JSON configuration file.
+
+    Returns:
+        Tuple of `(tools_list, session_manager, server_infos)` where:
+            - tools_list: List of LangChain `BaseTool` objects
+            - session_manager: `MCPSessionManager` instance
+                (call `cleanup()` when done)
+            - server_infos: List of `MCPServerInfo` with per-server metadata
+    """
+    config = load_mcp_config(config_path)
+    return await _load_tools_from_config(config)
+
+
+async def resolve_and_load_mcp_tools(
+    *,
+    explicit_config_path: str | None = None,
+    no_mcp: bool = False,
+    trust_project_mcp: bool | None = None,
+    project_context: ProjectContext | None = None,
+) -> tuple[list[BaseTool], MCPSessionManager | None, list[MCPServerInfo]]:
+    """Resolve MCP config and load tools.
+
+    Auto-discovers configs from standard locations and merges them.
+    When `explicit_config_path` is provided it is added as the
+    highest-precedence source (errors in that file are fatal).
+
+    Args:
+        explicit_config_path: Extra config file to layer on top of
+            auto-discovered configs (highest precedence). Errors are
+            fatal.
+        no_mcp: If True, disable all MCP loading.
+        trust_project_mcp: Controls project-level stdio server trust:
+
+            - `True`: allow all project stdio servers (flag/prompt approved).
+            - `False`: filter out project stdio servers, log warning.
+            - `None` (default): check the persistent trust store; if the
+                fingerprint matches, allow; otherwise filter + warn.
+        project_context: Explicit project path context for config discovery
+            and trust resolution.
+
+    Returns:
+        Tuple of `(tools_list, session_manager, server_infos)`.
+
+            When no tools are loaded, returns `([], None, [])`.
+
+    Raises:
+        RuntimeError: If an MCP server config is invalid or fails to
+            spawn/connect.
+    """
+    if no_mcp:
+        return [], None, []
+
+    # Auto-discovery
+    try:
+        config_paths = discover_mcp_configs(project_context=project_context)
+    except (OSError, RuntimeError):
+        logger.warning("MCP config auto-discovery failed", exc_info=True)
+        config_paths = []
+
+    # Classify discovered configs and apply trust filtering
+    user_configs, project_configs = classify_discovered_configs(config_paths)
+
+    configs: list[dict[str, Any]] = []
+
+    # User-level configs are always trusted
+    for path in user_configs:
+        cfg = load_mcp_config_lenient(path)
+        if cfg is not None:
+            configs.append(cfg)
+
+    # Project-level configs need trust gating for stdio servers
+    for path in project_configs:
+        cfg = load_mcp_config_lenient(path)
+        if cfg is None:
+            continue
+
+        stdio_servers = extract_stdio_server_commands(cfg)
+        if not stdio_servers:
+            # No stdio servers — safe to load (remote only)
+            configs.append(cfg)
+            continue
+
+        if trust_project_mcp is True:
+            configs.append(cfg)
+        elif trust_project_mcp is False:
+            filtered = _filter_project_stdio_servers(cfg)
+            if filtered.get("mcpServers"):
+                configs.append(filtered)
+            skipped = [
+                f"{name}: {cmd} {' '.join(args)}" for name, cmd, args in stdio_servers
+            ]
+            logger.warning(
+                "Skipped untrusted project stdio MCP servers: %s",
+                "; ".join(skipped),
+            )
+        else:
+            # None — check trust store
+            from deepagents_cli.mcp_trust import (
+                compute_config_fingerprint,
+                is_project_mcp_trusted,
+            )
+
+            project_root = str(_resolve_project_config_base(project_context).resolve())
+            fingerprint = compute_config_fingerprint(project_configs)
+            if is_project_mcp_trusted(project_root, fingerprint):
+                configs.append(cfg)
+            else:
+                filtered = _filter_project_stdio_servers(cfg)
+                if filtered.get("mcpServers"):
+                    configs.append(filtered)
+                skipped = [
+                    f"{name}: {cmd} {' '.join(args)}"
+                    for name, cmd, args in stdio_servers
+                ]
+                logger.warning(
+                    "Skipped untrusted project stdio MCP servers "
+                    "(config changed or not yet approved): %s",
+                    "; ".join(skipped),
+                )
+
+    # Explicit path is highest precedence — errors are fatal
+    if explicit_config_path:
+        config_path = (
+            str(project_context.resolve_user_path(explicit_config_path))
+            if project_context is not None
+            else explicit_config_path
+        )
+        configs.append(load_mcp_config(config_path))
+
+    if not configs:
+        return [], None, []
+
+    merged = merge_mcp_configs(configs)
+    if not merged.get("mcpServers"):
+        return [], None, []
+
+    # Validate each server in the merged config
+    try:
+        for server_name, server_config in merged["mcpServers"].items():
+            _validate_server_config(server_name, server_config)
+    except (TypeError, ValueError) as e:
+        msg = f"Invalid MCP server configuration: {e}"
+        raise RuntimeError(msg) from e
+
+    return await _load_tools_from_config(merged)

@@ -1,6 +1,7 @@
 """Tests for config module including project discovery utilities."""
 
-import os
+import logging
+import time
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -9,73 +10,30 @@ import pytest
 from deepagents_cli import model_config
 from deepagents_cli.config import (
     RECOMMENDED_SAFE_SHELL_COMMANDS,
+    SHELL_ALLOW_ALL,
     ModelResult,
     Settings,
     _create_model_from_class,
-    _find_project_agent_md,
-    _find_project_root,
+    _create_model_via_init,
     _get_provider_kwargs,
     build_langsmith_thread_url,
     create_model,
     detect_provider,
     fetch_langsmith_project_url,
     get_langsmith_project_name,
+    newline_shortcut,
     parse_shell_allow_list,
     reset_langsmith_url_cache,
     settings,
     validate_model_capabilities,
 )
 from deepagents_cli.model_config import ModelConfigError, clear_caches
-
-
-class TestDotenvLoading:
-    """Tests for `.env` loading behavior."""
-
-    def test_load_dotenv_from_cwd(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Confirm `.env` in the current working directory is loaded."""
-
-        monkeypatch.chdir(tmp_path)
-        (tmp_path / ".env").write_text("DEEPAGENTS_DOTENV_TEST=1\n")
-
-        monkeypatch.delenv("DEEPAGENTS_DOTENV_TEST", raising=False)
-
-        import deepagents_cli.config as config
-
-        config._load_dotenv_from_cwd()
-        assert os.environ.get("DEEPAGENTS_DOTENV_TEST") == "1"
-
-    def test_dotenv_overrides_empty_env_var(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Confirm `.env` populates variables that are set but empty."""
-
-        monkeypatch.chdir(tmp_path)
-        (tmp_path / ".env").write_text("AZURE_OPENAI_DEPLOYMENT=from_dotenv\n")
-
-        monkeypatch.setenv("AZURE_OPENAI_DEPLOYMENT", "")
-
-        import deepagents_cli.config as config
-
-        config._load_dotenv_from_cwd()
-        assert os.environ.get("AZURE_OPENAI_DEPLOYMENT") == "from_dotenv"
-
-
-class TestAzureDeploymentEnvAliases:
-    """Tests for Azure deployment environment variable aliases."""
-
-    def test_settings_reads_azure_deployment_alias(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Confirm `AZURE_OPENAI_API_DEPLOYMENT_NAME` is accepted."""
-
-        monkeypatch.setenv("AZURE_OPENAI_API_KEY", "key")
-        monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://example.openai.azure.com")
-        monkeypatch.setenv("AZURE_OPENAI_API_VERSION", "2025-01-01-preview")
-        monkeypatch.delenv("AZURE_OPENAI_DEPLOYMENT", raising=False)
-        monkeypatch.setenv("AZURE_OPENAI_API_DEPLOYMENT_NAME", "my-deployment")
-
-        settings_obj = Settings.from_environment()
-        assert settings_obj.azure_openai_deployment == "my-deployment"
+from deepagents_cli.project_utils import (
+    ProjectContext,
+    find_project_agent_md as _find_project_agent_md,
+    find_project_root as _find_project_root,
+    get_server_project_context,
+)
 
 
 class TestProjectRootDetection:
@@ -120,6 +78,46 @@ class TestProjectRootDetection:
         # Should find inner repo, not outer
         result = _find_project_root(inner_repo)
         assert result == inner_repo
+
+
+class TestProjectContext:
+    """Tests for explicit project context handling."""
+
+    def test_from_user_cwd_uses_explicit_path_not_process_cwd(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Project context should resolve from the provided user cwd."""
+        project_root = tmp_path / "project"
+        project_root.mkdir()
+        (project_root / ".git").mkdir()
+        user_cwd = project_root / "src"
+        user_cwd.mkdir()
+
+        other_cwd = tmp_path / "elsewhere"
+        other_cwd.mkdir()
+        monkeypatch.chdir(other_cwd)
+
+        context = ProjectContext.from_user_cwd(user_cwd)
+
+        assert context.user_cwd == user_cwd.resolve()
+        assert context.project_root == project_root
+
+    def test_get_server_project_context_from_env_mapping(self, tmp_path: Path) -> None:
+        """Server context should reconstruct explicit cwd and project root."""
+        project_root = tmp_path / "project"
+        project_root.mkdir()
+        user_cwd = project_root / "src"
+        user_cwd.mkdir()
+
+        env = {
+            "DA_SERVER_CWD": str(user_cwd),
+            "DA_SERVER_PROJECT_ROOT": str(project_root),
+        }
+        context = get_server_project_context(env)
+
+        assert context is not None
+        assert context.user_cwd == user_cwd.resolve()
+        assert context.project_root == project_root.resolve()
 
 
 class TestProjectAgentMdFinding:
@@ -180,6 +178,74 @@ class TestProjectAgentMdFinding:
 
         result = _find_project_agent_md(project_root)
         assert result == []
+
+    def test_skips_paths_with_permission_errors(self, tmp_path: Path) -> None:
+        """Test that OSError from Path.exists() is caught gracefully."""
+        project_root = tmp_path / "project"
+        project_root.mkdir()
+
+        real_md = project_root / "AGENTS.md"
+        real_md.write_text("root instructions")
+
+        original_exists = Path.exists
+
+        def patched_exists(self: Path) -> bool:
+            if self.name == "AGENTS.md" and ".deepagents" in str(self):
+                msg = "Permission denied"
+                raise PermissionError(msg)
+            return original_exists(self)
+
+        with patch.object(Path, "exists", patched_exists):
+            result = _find_project_agent_md(project_root)
+
+        assert len(result) == 1
+        assert result[0] == real_md
+
+
+class TestSettingsGetProjectAgentMdPath:
+    """Test Settings.get_project_agent_md_path() integration."""
+
+    def test_returns_empty_list_when_no_project_root(self) -> None:
+        """Should return [] when project_root is None."""
+        s = Settings.__new__(Settings)
+        s.project_root = None
+        assert s.get_project_agent_md_path() == []
+
+    def test_returns_existing_paths(self, tmp_path: Path) -> None:
+        """Should return existing AGENTS.md paths from project root."""
+        deepagents_dir = tmp_path / ".deepagents"
+        deepagents_dir.mkdir()
+        deepagents_md = deepagents_dir / "AGENTS.md"
+        deepagents_md.write_text("inner")
+
+        root_md = tmp_path / "AGENTS.md"
+        root_md.write_text("root")
+
+        s = Settings.__new__(Settings)
+        s.project_root = tmp_path
+
+        result = s.get_project_agent_md_path()
+        assert result == [deepagents_md, root_md]
+
+    def test_returns_empty_when_no_agents_md_files(self, tmp_path: Path) -> None:
+        """Should return [] when project exists but has no AGENTS.md."""
+        s = Settings.__new__(Settings)
+        s.project_root = tmp_path
+        assert s.get_project_agent_md_path() == []
+
+
+class TestNewlineShortcut:
+    """Tests for platform-specific newline shortcut labels."""
+
+    def test_returns_option_enter_on_macos(self) -> None:
+        """Should show Option+Enter on darwin."""
+        with patch("deepagents_cli.config.sys.platform", "darwin"):
+            assert newline_shortcut() == "Option+Enter"
+
+    def test_returns_ctrl_j_on_non_macos(self) -> None:
+        """Should show Ctrl+J on non-darwin platforms."""
+        with patch("deepagents_cli.config.sys.platform", "linux"):
+            assert newline_shortcut() == "Ctrl+J"
 
 
 class TestValidateModelCapabilities:
@@ -336,6 +402,33 @@ class TestAgentsAliasDirectories:
         assert settings.get_project_agent_skills_dir() is None
 
 
+class TestClaudeSkillsDirs:
+    """Tests for .claude/skills/ directory methods."""
+
+    def test_get_user_claude_skills_dir(self) -> None:
+        """Test get_user_claude_skills_dir returns ~/.claude/skills."""
+        expected = Path.home() / ".claude" / "skills"
+        assert Settings.get_user_claude_skills_dir() == expected
+
+    def test_get_project_claude_skills_dir_with_project(self, tmp_path: Path) -> None:
+        """Test get_project_claude_skills_dir returns .claude/skills in project."""
+        project_root = tmp_path / "my-project"
+        project_root.mkdir()
+        (project_root / ".git").mkdir()
+
+        settings = Settings.from_environment(start_path=project_root)
+        expected = project_root / ".claude" / "skills"
+        assert settings.get_project_claude_skills_dir() == expected
+
+    def test_project_claude_skills_dir_without_project(self, tmp_path: Path) -> None:
+        """Test get_project_claude_skills_dir returns None outside a project."""
+        no_project = tmp_path / "no-project"
+        no_project.mkdir()
+
+        settings = Settings.from_environment(start_path=no_project)
+        assert settings.get_project_claude_skills_dir() is None
+
+
 class TestCreateModelProfileExtraction:
     """Tests for profile extraction in create_model.
 
@@ -344,7 +437,7 @@ class TestCreateModelProfileExtraction:
     now uses it internally.
     """
 
-    @patch("deepagents_cli.config.init_chat_model")
+    @patch("langchain.chat_models.init_chat_model")
     def test_extracts_context_limit_from_profile(
         self, mock_init_chat_model: Mock
     ) -> None:
@@ -356,7 +449,7 @@ class TestCreateModelProfileExtraction:
         result = create_model("anthropic:claude-sonnet-4-5")
         assert result.context_limit == 200000
 
-    @patch("deepagents_cli.config.init_chat_model")
+    @patch("langchain.chat_models.init_chat_model")
     def test_handles_missing_profile_gracefully(
         self, mock_init_chat_model: Mock
     ) -> None:
@@ -367,7 +460,7 @@ class TestCreateModelProfileExtraction:
         result = create_model("anthropic:claude-sonnet-4-5")
         assert result.context_limit is None
 
-    @patch("deepagents_cli.config.init_chat_model")
+    @patch("langchain.chat_models.init_chat_model")
     def test_handles_none_profile(self, mock_init_chat_model: Mock) -> None:
         """Test that profile=None leaves context_limit as None."""
         mock_model = Mock()
@@ -377,7 +470,7 @@ class TestCreateModelProfileExtraction:
         result = create_model("anthropic:claude-sonnet-4-5")
         assert result.context_limit is None
 
-    @patch("deepagents_cli.config.init_chat_model")
+    @patch("langchain.chat_models.init_chat_model")
     def test_handles_non_dict_profile(self, mock_init_chat_model: Mock) -> None:
         """Test that non-dict profile is handled safely."""
         mock_model = Mock()
@@ -387,7 +480,7 @@ class TestCreateModelProfileExtraction:
         result = create_model("anthropic:claude-sonnet-4-5")
         assert result.context_limit is None
 
-    @patch("deepagents_cli.config.init_chat_model")
+    @patch("langchain.chat_models.init_chat_model")
     def test_handles_non_int_max_input_tokens(self, mock_init_chat_model: Mock) -> None:
         """Test that string max_input_tokens is ignored."""
         mock_model = Mock()
@@ -397,7 +490,7 @@ class TestCreateModelProfileExtraction:
         result = create_model("anthropic:claude-sonnet-4-5")
         assert result.context_limit is None
 
-    @patch("deepagents_cli.config.init_chat_model")
+    @patch("langchain.chat_models.init_chat_model")
     def test_handles_missing_max_input_tokens_key(
         self, mock_init_chat_model: Mock
     ) -> None:
@@ -410,160 +503,273 @@ class TestCreateModelProfileExtraction:
         assert result.context_limit is None
 
 
-class TestCreateModelAdditionalProviders:
-    """Tests for additional providers in create_model()."""
+class TestCreateModelProfileOverrides:
+    """Tests for profile overrides from config.toml in create_model."""
 
-    def setup_method(self) -> None:
-        settings.model_context_limit = None
-        settings.model_name = None
-        settings.model_provider = None
-
-    def _save_provider_settings(self) -> dict[str, object]:
-        return {
-            "openai_api_key": settings.openai_api_key,
-            "openai_base_url": getattr(settings, "openai_base_url", None),
-            "anthropic_api_key": settings.anthropic_api_key,
-            "google_api_key": settings.google_api_key,
-            "google_cloud_project": settings.google_cloud_project,
-            "azure_openai_api_key": settings.azure_openai_api_key,
-            "azure_openai_endpoint": settings.azure_openai_endpoint,
-            "azure_openai_api_version": settings.azure_openai_api_version,
-            "azure_openai_deployment": settings.azure_openai_deployment,
-            "ollama_base_url": settings.ollama_base_url,
-            "ollama_model": settings.ollama_model,
-            "lmstudio_base_url": settings.lmstudio_base_url,
-            "lmstudio_model": settings.lmstudio_model,
-        }
-
-    def _restore_provider_settings(self, saved: dict[str, object]) -> None:
-        settings.openai_api_key = saved["openai_api_key"]  # type: ignore[assignment]
-        settings.openai_base_url = saved["openai_base_url"]  # type: ignore[assignment]
-        settings.anthropic_api_key = saved["anthropic_api_key"]  # type: ignore[assignment]
-        settings.google_api_key = saved["google_api_key"]  # type: ignore[assignment]
-        settings.google_cloud_project = saved["google_cloud_project"]  # type: ignore[assignment]
-        settings.azure_openai_api_key = saved["azure_openai_api_key"]  # type: ignore[assignment]
-        settings.azure_openai_endpoint = saved["azure_openai_endpoint"]  # type: ignore[assignment]
-        settings.azure_openai_api_version = saved["azure_openai_api_version"]  # type: ignore[assignment]
-        settings.azure_openai_deployment = saved["azure_openai_deployment"]  # type: ignore[assignment]
-        settings.ollama_base_url = saved["ollama_base_url"]  # type: ignore[assignment]
-        settings.ollama_model = saved["ollama_model"]  # type: ignore[assignment]
-        settings.lmstudio_base_url = saved["lmstudio_base_url"]  # type: ignore[assignment]
-        settings.lmstudio_model = saved["lmstudio_model"]  # type: ignore[assignment]
-
-    @patch("deepagents_cli.config.init_chat_model")
-    def test_creates_openai_model_with_custom_base_url(
-        self, mock_init_chat_model: Mock
+    @patch("langchain.chat_models.init_chat_model")
+    def test_profile_override_sets_context_limit(
+        self, mock_init_chat_model: Mock, tmp_path: Path
     ) -> None:
+        """Profile override for max_input_tokens flows to context_limit."""
+        config_path = tmp_path / "config.toml"
+        config_path.write_text("""
+[models.providers.anthropic.profile]
+max_input_tokens = 4096
+""")
         mock_model = Mock()
-        mock_model.profile = {"tool_calling": True}
+        mock_model.profile = {"max_input_tokens": 200000, "tool_calling": True}
         mock_init_chat_model.return_value = mock_model
 
-        saved = self._save_provider_settings()
-        try:
-            settings.openai_api_key = "test-key"
-            settings.openai_base_url = "https://openai.generative.engine.capgemini.com/v1"
-            settings.anthropic_api_key = None
-            settings.google_api_key = None
-            settings.google_cloud_project = None
+        clear_caches()
+        with patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path):
+            result = create_model("anthropic:claude-sonnet-4-5")
 
-            result = create_model("openai:amazon.nova-lite-v1:0")
-            assert isinstance(result, ModelResult)
-            mock_init_chat_model.assert_called_once()
-            assert mock_init_chat_model.call_args.args[0] == "amazon.nova-lite-v1:0"
-            assert mock_init_chat_model.call_args.kwargs["model_provider"] == "openai"
-            assert (
-                mock_init_chat_model.call_args.kwargs["base_url"]
-                == "https://openai.generative.engine.capgemini.com/v1"
+        assert result.context_limit == 4096
+
+    @patch("langchain.chat_models.init_chat_model")
+    def test_per_model_profile_override_takes_precedence(
+        self, mock_init_chat_model: Mock, tmp_path: Path
+    ) -> None:
+        """Per-model profile override wins over provider-wide default."""
+        config_path = tmp_path / "config.toml"
+        config_path.write_text("""
+[models.providers.anthropic.profile]
+max_input_tokens = 4096
+
+[models.providers.anthropic.profile."claude-sonnet-4-5"]
+max_input_tokens = 8192
+""")
+        mock_model = Mock()
+        mock_model.profile = {"max_input_tokens": 200000, "tool_calling": True}
+        mock_init_chat_model.return_value = mock_model
+
+        clear_caches()
+        with patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path):
+            result = create_model("anthropic:claude-sonnet-4-5")
+
+        assert result.context_limit == 8192
+
+    @patch("langchain.chat_models.init_chat_model")
+    def test_no_profile_override_preserves_original(
+        self, mock_init_chat_model: Mock, tmp_path: Path
+    ) -> None:
+        """Without config overrides, original profile value is used."""
+        config_path = tmp_path / "config.toml"  # Does not exist — empty config
+        mock_model = Mock()
+        mock_model.profile = {"max_input_tokens": 200000, "tool_calling": True}
+        mock_init_chat_model.return_value = mock_model
+
+        clear_caches()
+        with patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path):
+            result = create_model("anthropic:claude-sonnet-4-5")
+        assert result.context_limit == 200000
+
+    @patch("langchain.chat_models.init_chat_model")
+    def test_profile_override_on_model_without_profile(
+        self, mock_init_chat_model: Mock, tmp_path: Path
+    ) -> None:
+        """Profile override is applied even when model has no profile attr."""
+        config_path = tmp_path / "config.toml"
+        config_path.write_text("""
+[models.providers.anthropic.profile]
+max_input_tokens = 4096
+""")
+        mock_model = Mock(spec=["invoke"])  # No profile attribute
+        mock_init_chat_model.return_value = mock_model
+
+        clear_caches()
+        with patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path):
+            result = create_model("anthropic:claude-sonnet-4-5")
+
+        assert result.context_limit == 4096
+
+    @patch("langchain.chat_models.init_chat_model")
+    def test_profile_override_preserves_non_overridden_keys(
+        self, mock_init_chat_model: Mock, tmp_path: Path
+    ) -> None:
+        """Override merges into existing profile without dropping other keys."""
+        config_path = tmp_path / "config.toml"
+        config_path.write_text("""
+[models.providers.anthropic.profile]
+max_input_tokens = 4096
+""")
+        mock_model = Mock()
+        mock_model.profile = {"max_input_tokens": 200000, "tool_calling": True}
+        mock_init_chat_model.return_value = mock_model
+
+        clear_caches()
+        with patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path):
+            create_model("anthropic:claude-sonnet-4-5")
+
+        assert mock_model.profile == {"max_input_tokens": 4096, "tool_calling": True}
+
+    @patch("langchain.chat_models.init_chat_model")
+    def test_profile_override_when_profile_is_none(
+        self, mock_init_chat_model: Mock, tmp_path: Path
+    ) -> None:
+        """Override is applied when model.profile is explicitly None."""
+        config_path = tmp_path / "config.toml"
+        config_path.write_text("""
+[models.providers.anthropic.profile]
+max_input_tokens = 4096
+""")
+        mock_model = Mock()
+        mock_model.profile = None
+        mock_init_chat_model.return_value = mock_model
+
+        clear_caches()
+        with patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path):
+            result = create_model("anthropic:claude-sonnet-4-5")
+
+        assert result.context_limit == 4096
+
+    @patch("langchain.chat_models.init_chat_model")
+    def test_profile_override_logs_warning_on_frozen_model(
+        self,
+        mock_init_chat_model: Mock,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Graceful warning when model rejects attribute assignment."""
+        config_path = tmp_path / "config.toml"
+        config_path.write_text("""
+[models.providers.anthropic.profile]
+max_input_tokens = 4096
+""")
+        mock_model = Mock()
+        # Make .profile read return a dict but assignment raises
+        type(mock_model).profile = property(
+            fget=lambda _: {"max_input_tokens": 200000},
+            fset=lambda _, __: (_ for _ in ()).throw(AttributeError("frozen")),
+        )
+        mock_init_chat_model.return_value = mock_model
+
+        clear_caches()
+        with (
+            patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path),
+            caplog.at_level(logging.WARNING, logger="deepagents_cli.config"),
+        ):
+            result = create_model("anthropic:claude-sonnet-4-5")
+
+        assert any(
+            "Could not apply" in r.message and "profile overrides" in r.message
+            for r in caplog.records
+        )
+        # Falls back to original profile extraction
+        assert result.context_limit == 200000
+
+
+class TestCreateModelCLIProfileOverrides:
+    """Tests for CLI --profile-override in create_model."""
+
+    @patch("langchain.chat_models.init_chat_model")
+    def test_cli_profile_override_sets_context_limit(
+        self, mock_init_chat_model: Mock, tmp_path: Path
+    ) -> None:
+        """CLI profile override for max_input_tokens flows to context_limit."""
+        config_path = tmp_path / "config.toml"
+        config_path.write_text("")  # empty config
+        mock_model = Mock()
+        mock_model.profile = {"max_input_tokens": 200000, "tool_calling": True}
+        mock_init_chat_model.return_value = mock_model
+
+        clear_caches()
+        with patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path):
+            result = create_model(
+                "anthropic:claude-sonnet-4-5",
+                profile_overrides={"max_input_tokens": 4096},
             )
-            assert mock_init_chat_model.call_args.kwargs["api_key"] == "test-key"
-        finally:
-            self._restore_provider_settings(saved)
 
-    @patch("deepagents_cli.config.init_chat_model")
-    def test_creates_ollama_model_with_api_base(self, mock_init_chat_model: Mock) -> None:
+        assert result.context_limit == 4096
+
+    @patch("langchain.chat_models.init_chat_model")
+    def test_cli_profile_override_beats_config_toml(
+        self, mock_init_chat_model: Mock, tmp_path: Path
+    ) -> None:
+        """CLI --profile-override wins over config.toml profile."""
+        config_path = tmp_path / "config.toml"
+        config_path.write_text("""
+[models.providers.anthropic.profile]
+max_input_tokens = 8192
+""")
         mock_model = Mock()
-        mock_model.profile = {"tool_calling": True}
+        mock_model.profile = {"max_input_tokens": 200000, "tool_calling": True}
         mock_init_chat_model.return_value = mock_model
 
-        saved = self._save_provider_settings()
-        try:
-            settings.openai_api_key = None
-            settings.anthropic_api_key = None
-            settings.google_api_key = None
-            settings.google_cloud_project = None
-
-            settings.ollama_base_url = "http://localhost:11434/v1"
-            settings.lmstudio_base_url = None
-
-            result = create_model("ollama:llama3")
-            assert isinstance(result, ModelResult)
-            mock_init_chat_model.assert_called_once()
-            assert mock_init_chat_model.call_args.args[0] == "llama3"
-            assert mock_init_chat_model.call_args.kwargs["model_provider"] == "openai"
-            assert mock_init_chat_model.call_args.kwargs["base_url"] == "http://localhost:11434/v1"
-            assert mock_init_chat_model.call_args.kwargs["api_key"] == "local"
-        finally:
-            self._restore_provider_settings(saved)
-
-    @patch("deepagents_cli.config.init_chat_model")
-    def test_creates_lmstudio_model_with_api_base(self, mock_init_chat_model: Mock) -> None:
-        mock_model = Mock()
-        mock_model.profile = {"tool_calling": True}
-        mock_init_chat_model.return_value = mock_model
-
-        saved = self._save_provider_settings()
-        try:
-            settings.openai_api_key = None
-            settings.anthropic_api_key = None
-            settings.google_api_key = None
-            settings.google_cloud_project = None
-
-            settings.ollama_base_url = None
-            settings.lmstudio_base_url = "http://localhost:1234/v1"
-
-            result = create_model("lmstudio:my-model")
-            assert isinstance(result, ModelResult)
-            mock_init_chat_model.assert_called_once()
-            assert mock_init_chat_model.call_args.args[0] == "my-model"
-            assert mock_init_chat_model.call_args.kwargs["model_provider"] == "openai"
-            assert mock_init_chat_model.call_args.kwargs["base_url"] == "http://localhost:1234/v1"
-            assert mock_init_chat_model.call_args.kwargs["api_key"] == "local"
-        finally:
-            self._restore_provider_settings(saved)
-
-    @patch("deepagents_cli.config.init_chat_model")
-    def test_creates_azure_model_with_custom_endpoint(self, mock_init_chat_model: Mock) -> None:
-        mock_model = Mock()
-        mock_model.profile = {"tool_calling": True}
-        mock_init_chat_model.return_value = mock_model
-
-        saved = self._save_provider_settings()
-        try:
-            settings.openai_api_key = None
-            settings.anthropic_api_key = None
-            settings.google_api_key = None
-            settings.google_cloud_project = None
-
-            settings.azure_openai_api_key = "azure-key"
-            settings.azure_openai_endpoint = "https://ai.mycorp.com/"
-            settings.azure_openai_api_version = "2024-10-21"
-
-            result = create_model("azure:my-deployment")
-            assert isinstance(result, ModelResult)
-            mock_init_chat_model.assert_called_once()
-            assert mock_init_chat_model.call_args.args[0] == "my-deployment"
-            assert (
-                mock_init_chat_model.call_args.kwargs["model_provider"]
-                == "azure_openai"
+        clear_caches()
+        with patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path):
+            result = create_model(
+                "anthropic:claude-sonnet-4-5",
+                profile_overrides={"max_input_tokens": 4096},
             )
-            assert mock_init_chat_model.call_args.kwargs["api_key"] == "azure-key"
-            assert (
-                mock_init_chat_model.call_args.kwargs["azure_endpoint"]
-                == "https://ai.mycorp.com/"
+
+        # CLI (4096) beats config.toml (8192)
+        assert result.context_limit == 4096
+
+    @patch("langchain.chat_models.init_chat_model")
+    def test_cli_profile_override_preserves_other_keys(
+        self, mock_init_chat_model: Mock, tmp_path: Path
+    ) -> None:
+        """CLI override merges into profile without dropping other keys."""
+        config_path = tmp_path / "config.toml"
+        config_path.write_text("")
+        mock_model = Mock()
+        mock_model.profile = {"max_input_tokens": 200000, "tool_calling": True}
+        mock_init_chat_model.return_value = mock_model
+
+        clear_caches()
+        with patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path):
+            create_model(
+                "anthropic:claude-sonnet-4-5",
+                profile_overrides={"max_input_tokens": 4096},
             )
-            assert mock_init_chat_model.call_args.kwargs["api_version"] == "2024-10-21"
-        finally:
-            self._restore_provider_settings(saved)
+
+        assert mock_model.profile == {"max_input_tokens": 4096, "tool_calling": True}
+
+    @patch("langchain.chat_models.init_chat_model")
+    def test_cli_profile_override_on_model_without_profile(
+        self, mock_init_chat_model: Mock, tmp_path: Path
+    ) -> None:
+        """CLI override applied even when model has no profile attr."""
+        config_path = tmp_path / "config.toml"
+        config_path.write_text("")
+        mock_model = Mock(spec=["invoke"])
+        mock_init_chat_model.return_value = mock_model
+
+        clear_caches()
+        with patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path):
+            result = create_model(
+                "anthropic:claude-sonnet-4-5",
+                profile_overrides={"max_input_tokens": 4096},
+            )
+
+        assert result.context_limit == 4096
+
+    @patch("langchain.chat_models.init_chat_model")
+    def test_cli_profile_override_raises_on_frozen_model(
+        self,
+        mock_init_chat_model: Mock,
+        tmp_path: Path,
+    ) -> None:
+        """CLI --profile-override raises when model rejects assignment."""
+        config_path = tmp_path / "config.toml"
+        config_path.write_text("")
+        mock_model = Mock()
+        type(mock_model).profile = property(
+            fget=lambda _: {"max_input_tokens": 200000},
+            fset=lambda _, __: (_ for _ in ()).throw(AttributeError("frozen")),
+        )
+        mock_init_chat_model.return_value = mock_model
+
+        clear_caches()
+        with (
+            patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path),
+            pytest.raises(ModelConfigError, match="Could not apply CLI"),
+        ):
+            create_model(
+                "anthropic:claude-sonnet-4-5",
+                profile_overrides={"max_input_tokens": 4096},
+            )
 
 
 class TestParseShellAllowList:
@@ -633,6 +839,27 @@ class TestParseShellAllowList:
         # Total should be: 1 (ls) + len(recommended) - 1 (duplicate ls) + 1 (mycmd)
         # Which simplifies to: len(recommended) + 1
         assert len(result) == len(RECOMMENDED_SAFE_SHELL_COMMANDS) + 1
+
+    def test_all_returns_sentinel(self) -> None:
+        """Test that 'all' returns SHELL_ALLOW_ALL sentinel."""
+        result = parse_shell_allow_list("all")
+        assert result is SHELL_ALLOW_ALL
+
+    def test_all_case_insensitive(self) -> None:
+        """Test that 'ALL', 'All', etc. all return sentinel."""
+        for variant in ["ALL", "All", "aLl", "  all  "]:
+            result = parse_shell_allow_list(variant)
+            assert result is SHELL_ALLOW_ALL
+
+    def test_all_mixed_with_commands_raises(self) -> None:
+        """Combining 'all' with other commands should raise ValueError."""
+        with pytest.raises(ValueError, match="Cannot combine 'all'"):
+            parse_shell_allow_list("all,ls")
+
+    def test_all_mixed_case_insensitive_raises(self) -> None:
+        """Combining 'ALL' with other commands should also raise."""
+        with pytest.raises(ValueError, match="Cannot combine 'all'"):
+            parse_shell_allow_list("ls,ALL,cat")
 
     def test_empty_commands_ignored(self) -> None:
         """Test that empty strings from split are ignored."""
@@ -746,6 +973,44 @@ class TestFetchLangsmithProjectUrl:
 
         assert result is None
 
+    def test_returns_none_on_project_not_found(self) -> None:
+        """Should return None when the project does not exist yet."""
+        from langsmith.utils import LangSmithNotFoundError
+
+        with patch("langsmith.Client") as mock_client_cls:
+            mock_client_cls.return_value.read_project.side_effect = (
+                LangSmithNotFoundError("Project angus-dacli not found")
+            )
+            result = fetch_langsmith_project_url("angus-dacli")
+
+        assert result is None
+
+    def test_returns_none_on_unexpected_exception(self) -> None:
+        """Should return None on unexpected SDK exceptions."""
+        with patch("langsmith.Client") as mock_client_cls:
+            mock_client_cls.return_value.read_project.side_effect = TypeError(
+                "unexpected SDK type error"
+            )
+            result = fetch_langsmith_project_url("my-project")
+
+        assert result is None
+
+    def test_returns_none_when_lookup_times_out(self) -> None:
+        """Should return None when LangSmith lookup exceeds timeout."""
+        with (
+            patch(
+                "deepagents_cli.config._LANGSMITH_URL_LOOKUP_TIMEOUT_SECONDS",
+                0.01,
+            ),
+            patch("langsmith.Client") as mock_client_cls,
+        ):
+            mock_client_cls.return_value.read_project.side_effect = lambda **_kwargs: (
+                time.sleep(0.02)
+            )
+            result = fetch_langsmith_project_url("my-project")
+
+        assert result is None
+
     def test_returns_none_when_url_is_none(self) -> None:
         """Should return None when the project has no URL."""
 
@@ -773,8 +1038,8 @@ class TestFetchLangsmithProjectUrl:
         assert second == first
         mock_client_cls.assert_called_once()
 
-    def test_caches_none_on_failure(self) -> None:
-        """Should cache None on failure so retries don't make network calls."""
+    def test_retries_after_failure(self) -> None:
+        """Should retry after failure instead of caching None."""
         with patch("langsmith.Client") as mock_client_cls:
             mock_client_cls.return_value.read_project.side_effect = OSError("timeout")
             first = fetch_langsmith_project_url("my-project")
@@ -782,7 +1047,22 @@ class TestFetchLangsmithProjectUrl:
 
         assert first is None
         assert second is None
-        mock_client_cls.assert_called_once()
+        assert mock_client_cls.return_value.read_project.call_count == 2
+
+    def test_retries_when_url_is_none(self) -> None:
+        """Should retry when the project URL is missing instead of caching None."""
+
+        class FakeProject:
+            url = None
+
+        with patch("langsmith.Client") as mock_client_cls:
+            mock_client_cls.return_value.read_project.return_value = FakeProject()
+            first = fetch_langsmith_project_url("my-project")
+            second = fetch_langsmith_project_url("my-project")
+
+        assert first is None
+        assert second is None
+        assert mock_client_cls.return_value.read_project.call_count == 2
 
     def test_different_project_name_fetches_again(self) -> None:
         """Should fetch again when called with a different project name."""
@@ -830,7 +1110,8 @@ class TestBuildLangsmithThreadUrl:
             result = build_langsmith_thread_url("thread-123")
 
         assert (
-            result == "https://smith.langchain.com/o/org/projects/p/proj/t/thread-123"
+            result
+            == "https://smith.langchain.com/o/org/projects/p/proj/t/thread-123?utm_source=deepagents-cli"
         )
 
     def test_strips_trailing_slash(self) -> None:
@@ -850,7 +1131,8 @@ class TestBuildLangsmithThreadUrl:
             result = build_langsmith_thread_url("thread-123")
 
         assert (
-            result == "https://smith.langchain.com/o/org/projects/p/proj/t/thread-123"
+            result
+            == "https://smith.langchain.com/o/org/projects/p/proj/t/thread-123?utm_source=deepagents-cli"
         )
 
     def test_returns_none_when_no_project_name(self) -> None:
@@ -991,7 +1273,7 @@ num_ctx = 4000
         with patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path):
             kwargs = _get_provider_kwargs("ollama", model_name="qwen3:4b")
 
-        assert kwargs["temperature"] == 0.5
+        assert kwargs["temperature"] == pytest.approx(0.5)
         assert kwargs["num_ctx"] == 4000
 
     def test_model_name_none_uses_provider_params(self, tmp_path: Path) -> None:
@@ -1032,6 +1314,46 @@ base_url = "https://wrong-url.com"
 
         # Explicit base_url field should win over kwargs.base_url
         assert kwargs["base_url"] == "https://correct-url.com"
+
+
+class TestOpenRouterHeaders:
+    """Tests for OpenRouter default attribution headers."""
+
+    def setup_method(self) -> None:
+        """Clear model config cache before each test."""
+        clear_caches()
+
+    def test_injects_attribution_kwargs(self) -> None:
+        """Injects app_url and app_title for openrouter provider."""
+        kwargs = _get_provider_kwargs("openrouter")
+
+        assert kwargs["app_url"] == "https://github.com/langchain-ai/deepagents"
+        assert kwargs["app_title"] == "Deep Agents CLI"
+
+    def test_per_model_attribution_overrides_defaults(self, tmp_path: Path) -> None:
+        """Per-model app_title overrides built-in default."""
+        config_path = tmp_path / "config.toml"
+        config_path.write_text("""
+[models.providers.openrouter]
+models = ["deepseek/deepseek-chat"]
+
+[models.providers.openrouter.params."deepseek/deepseek-chat"]
+app_title = "My Custom App"
+""")
+        with patch.object(model_config, "DEFAULT_CONFIG_PATH", config_path):
+            kwargs = _get_provider_kwargs(
+                "openrouter", model_name="deepseek/deepseek-chat"
+            )
+
+        assert kwargs["app_title"] == "My Custom App"
+        # Built-in app_url should still be present
+        assert kwargs["app_url"] == "https://github.com/langchain-ai/deepagents"
+
+    def test_no_attribution_for_other_providers(self) -> None:
+        """Other providers do not get OpenRouter attribution kwargs."""
+        kwargs = _get_provider_kwargs("openai")
+        assert "app_url" not in kwargs
+        assert "app_title" not in kwargs
 
 
 class TestCreateModelFromClass:
@@ -1215,7 +1537,7 @@ api_key_env = "FIREWORKS_API_KEY"
 class TestCreateModelExtraKwargs:
     """Tests for create_model() with extra_kwargs from --model-params."""
 
-    @patch("deepagents_cli.config.init_chat_model")
+    @patch("langchain.chat_models.init_chat_model")
     def test_extra_kwargs_passed_to_model(self, mock_init_chat_model: Mock) -> None:
         """extra_kwargs are forwarded to init_chat_model."""
         mock_model = Mock()
@@ -1225,9 +1547,9 @@ class TestCreateModelExtraKwargs:
         create_model("anthropic:claude-sonnet-4-5", extra_kwargs={"temperature": 0.7})
 
         _, call_kwargs = mock_init_chat_model.call_args
-        assert call_kwargs["temperature"] == 0.7
+        assert call_kwargs["temperature"] == pytest.approx(0.7)
 
-    @patch("deepagents_cli.config.init_chat_model")
+    @patch("langchain.chat_models.init_chat_model")
     def test_extra_kwargs_override_config(
         self, mock_init_chat_model: Mock, tmp_path: Path
     ) -> None:
@@ -1254,11 +1576,11 @@ max_tokens = 1024
 
         _, call_kwargs = mock_init_chat_model.call_args
         # CLI kwarg wins over config
-        assert call_kwargs["temperature"] == 0.9
+        assert call_kwargs["temperature"] == pytest.approx(0.9)
         # Config kwarg preserved when not overridden
         assert call_kwargs["max_tokens"] == 1024
 
-    @patch("deepagents_cli.config.init_chat_model")
+    @patch("langchain.chat_models.init_chat_model")
     def test_none_extra_kwargs_is_noop(self, mock_init_chat_model: Mock) -> None:
         """extra_kwargs=None does not affect behavior."""
         mock_model = Mock()
@@ -1268,7 +1590,7 @@ max_tokens = 1024
         create_model("anthropic:claude-sonnet-4-5", extra_kwargs=None)
         mock_init_chat_model.assert_called_once()
 
-    @patch("deepagents_cli.config.init_chat_model")
+    @patch("langchain.chat_models.init_chat_model")
     def test_empty_extra_kwargs_is_noop(self, mock_init_chat_model: Mock) -> None:
         """extra_kwargs={} does not affect behavior."""
         mock_model = Mock()
@@ -1282,7 +1604,7 @@ max_tokens = 1024
 class TestCreateModelEdgeCaseParsing:
     """Tests for create_model() edge-case spec parsing."""
 
-    @patch("deepagents_cli.config.init_chat_model")
+    @patch("langchain.chat_models.init_chat_model")
     def test_leading_colon_treated_as_bare_model(
         self, mock_init_chat_model: Mock
     ) -> None:
@@ -1306,7 +1628,7 @@ class TestCreateModelEdgeCaseParsing:
             create_model("anthropic:")
 
     @patch("deepagents_cli.config._get_default_model_spec")
-    @patch("deepagents_cli.config.init_chat_model")
+    @patch("langchain.chat_models.init_chat_model")
     def test_empty_string_uses_default(
         self, mock_init_chat_model: Mock, mock_default: Mock
     ) -> None:
@@ -1318,6 +1640,82 @@ class TestCreateModelEdgeCaseParsing:
 
         create_model("")
         mock_default.assert_called_once()
+
+
+class TestCreateModelViaInitImportError:
+    """Tests for _create_model_via_init() ImportError handling."""
+
+    @patch("langchain.chat_models.init_chat_model")
+    def test_missing_package_error(self, mock_init: Mock) -> None:
+        """Shows install hint when provider package is not installed."""
+        mock_init.side_effect = ImportError(
+            "No module named 'langchain_nvidia_ai_endpoints'"
+        )
+        with (
+            patch("importlib.util.find_spec", return_value=None),
+            pytest.raises(
+                ModelConfigError,
+                match="Missing package for provider 'nvidia'",
+            ),
+        ):
+            _create_model_via_init("nemotron", "nvidia", {})
+
+    @patch("langchain.chat_models.init_chat_model")
+    def test_installed_but_broken_import(self, mock_init: Mock) -> None:
+        """Shows real error when package is installed but import fails internally."""
+        mock_init.side_effect = ImportError("cannot import name 'foo' from 'bar'")
+        mock_spec = Mock()
+        with (
+            patch("importlib.util.find_spec", return_value=mock_spec) as mock_find_spec,
+            pytest.raises(
+                ModelConfigError,
+                match="installed but failed to import",
+            ),
+        ):
+            _create_model_via_init("nemotron", "nvidia", {})
+        mock_find_spec.assert_called_once_with("langchain_nvidia_ai_endpoints")
+
+    @patch("langchain.chat_models.init_chat_model")
+    def test_installed_but_broken_includes_original_error(
+        self, mock_init: Mock
+    ) -> None:
+        """Original ImportError message is included when package is installed."""
+        mock_init.side_effect = ImportError("some transitive dep missing")
+        mock_spec = Mock()
+        with (
+            patch("importlib.util.find_spec", return_value=mock_spec),
+            pytest.raises(ModelConfigError, match="some transitive dep missing"),
+        ):
+            _create_model_via_init("nemotron", "nvidia", {})
+
+    @patch("langchain.chat_models.init_chat_model")
+    def test_unknown_provider_fallback_package_name(self, mock_init: Mock) -> None:
+        """Unknown provider falls back to langchain-{provider} package name."""
+        mock_init.side_effect = ImportError("no module")
+        with (
+            patch("importlib.util.find_spec", return_value=None),
+            pytest.raises(
+                ModelConfigError,
+                match=r"pip install langchain-custom_provider",
+            ),
+        ):
+            _create_model_via_init("some-model", "custom_provider", {})
+
+    @patch("langchain.chat_models.init_chat_model")
+    def test_find_spec_raises_falls_back_to_missing(self, mock_init: Mock) -> None:
+        """find_spec failure falls back to 'missing package' message."""
+        mock_init.side_effect = ImportError("no module")
+        with (
+            patch(
+                "importlib.util.find_spec",
+                side_effect=ModuleNotFoundError("no parent"),
+            ),
+            pytest.raises(
+                ModelConfigError,
+                match="Missing package",
+            ),
+        ):
+            _create_model_via_init("model", "dotted.provider", {})
 
 
 class TestDetectProvider:
@@ -1333,7 +1731,9 @@ class TestDetectProvider:
             ("o4-mini", "openai"),
             ("claude-sonnet-4-5", "anthropic"),
             ("claude-opus-4-5", "anthropic"),
-            ("gemini-3-pro-preview", "google_genai"),
+            ("gemini-3.1-pro-preview", "google_genai"),
+            ("nemotron-3-nano-30b-a3b", "nvidia"),
+            ("nvidia/nemotron-3-nano-30b-a3b", "nvidia"),
             ("llama3", None),
             ("mistral-large", None),
             ("some-unknown-model", None),
@@ -1390,3 +1790,191 @@ class TestDetectProvider:
             assert detect_provider("GPT-4o") == "openai"
         finally:
             settings.anthropic_api_key = None
+
+
+class TestLazyModuleAttributes:
+    """Tests for lazy `__getattr__` resolution of `settings` and `console`."""
+
+    def test_getattr_returns_settings(self) -> None:
+        """Module __getattr__ resolves 'settings' to a Settings instance."""
+        from deepagents_cli.config import _get_settings
+
+        result = _get_settings()
+        assert isinstance(result, Settings)
+
+    def test_getattr_returns_console(self) -> None:
+        """Module __getattr__ resolves 'console' to a Console instance."""
+        from rich.console import Console
+
+        from deepagents_cli.config import _get_console
+
+        result = _get_console()
+        assert isinstance(result, Console)
+
+    def test_getattr_raises_for_unknown(self) -> None:
+        """Module __getattr__ raises AttributeError for unknown names."""
+        import deepagents_cli.config as config_mod
+
+        with pytest.raises(AttributeError, match="no attribute"):
+            getattr(config_mod, "nonexistent_attr_xyz")  # noqa: B009  # intentional __getattr__ test
+
+    def test_ensure_bootstrap_is_idempotent(self) -> None:
+        """_ensure_bootstrap is a no-op on second call."""
+        from deepagents_cli.config import _ensure_bootstrap
+
+        # First call already ran (settings was imported above).
+        # Calling again should be a harmless no-op.
+        _ensure_bootstrap()
+        assert isinstance(settings, Settings)
+
+    def test_ensure_bootstrap_marks_done_on_failure(self) -> None:
+        """_ensure_bootstrap sets flag even when the try body raises."""
+        import deepagents_cli.config as config_mod
+        from deepagents_cli.config import _ensure_bootstrap
+
+        # Reset flag so bootstrap will re-enter
+        original = config_mod._bootstrap_done
+        config_mod._bootstrap_done = False
+
+        try:
+            with patch(
+                "deepagents_cli.config._load_dotenv", side_effect=RuntimeError("boom")
+            ):
+                _ensure_bootstrap()  # should warn, not raise
+
+            # Flag must be set even after failure
+            assert config_mod._bootstrap_done is True
+        finally:
+            config_mod._bootstrap_done = original
+
+    def test_get_settings_returns_same_instance(self) -> None:
+        """_get_settings caches in globals — two calls return the same object."""
+        from deepagents_cli.config import _get_settings
+
+        a = _get_settings()
+        b = _get_settings()
+        assert a is b
+
+    def test_ensure_bootstrap_langsmith_override(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """_ensure_bootstrap copies DEEPAGENTS_LANGSMITH_PROJECT."""
+        import deepagents_cli.config as config_mod
+        from deepagents_cli.config import _ensure_bootstrap
+
+        original_done = config_mod._bootstrap_done
+        original_ls = config_mod._original_langsmith_project
+        config_mod._bootstrap_done = False
+
+        try:
+            monkeypatch.setenv("DEEPAGENTS_LANGSMITH_PROJECT", "my-agent-project")
+            monkeypatch.delenv("LANGSMITH_PROJECT", raising=False)
+
+            with (
+                patch("deepagents_cli.config._load_dotenv"),
+                patch(
+                    "deepagents_cli.project_utils.get_server_project_context",
+                    return_value=None,
+                ),
+            ):
+                _ensure_bootstrap()
+
+            assert config_mod._original_langsmith_project is None
+            import os
+
+            assert os.environ["LANGSMITH_PROJECT"] == "my-agent-project"
+        finally:
+            config_mod._bootstrap_done = original_done
+            config_mod._original_langsmith_project = original_ls
+
+    def test_ensure_bootstrap_preserves_original_langsmith(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """_ensure_bootstrap captures original LANGSMITH_PROJECT."""
+        import deepagents_cli.config as config_mod
+        from deepagents_cli.config import _ensure_bootstrap
+
+        original_done = config_mod._bootstrap_done
+        original_ls = config_mod._original_langsmith_project
+        config_mod._bootstrap_done = False
+
+        try:
+            monkeypatch.setenv("LANGSMITH_PROJECT", "user-project")
+            monkeypatch.setenv("DEEPAGENTS_LANGSMITH_PROJECT", "agent-project")
+
+            with (
+                patch("deepagents_cli.config._load_dotenv"),
+                patch(
+                    "deepagents_cli.project_utils.get_server_project_context",
+                    return_value=None,
+                ),
+            ):
+                _ensure_bootstrap()
+
+            assert config_mod._original_langsmith_project == "user-project"
+            import os
+
+            assert os.environ["LANGSMITH_PROJECT"] == "agent-project"
+        finally:
+            config_mod._bootstrap_done = original_done
+            config_mod._original_langsmith_project = original_ls
+
+
+class TestFindDotenvFromStartPath:
+    """Tests for _find_dotenv_from_start_path."""
+
+    def test_finds_env_in_start_dir(self, tmp_path: Path) -> None:
+        """Finds .env in the start directory itself."""
+        from deepagents_cli.config import _find_dotenv_from_start_path
+
+        env_file = tmp_path / ".env"
+        env_file.write_text("KEY=val")
+        assert _find_dotenv_from_start_path(tmp_path) == env_file
+
+    def test_finds_env_in_parent(self, tmp_path: Path) -> None:
+        """Finds .env in a parent directory."""
+        from deepagents_cli.config import _find_dotenv_from_start_path
+
+        env_file = tmp_path / ".env"
+        env_file.write_text("KEY=val")
+        child = tmp_path / "a" / "b"
+        child.mkdir(parents=True)
+        assert _find_dotenv_from_start_path(child) == env_file
+
+    def test_returns_none_when_no_env(self, tmp_path: Path) -> None:
+        """Returns None when no .env exists anywhere."""
+        from deepagents_cli.config import _find_dotenv_from_start_path
+
+        child = tmp_path / "a"
+        child.mkdir()
+        # No .env anywhere under tmp_path — the search will keep going
+        # to real parent dirs, but tmp_path itself has none
+        result = _find_dotenv_from_start_path(child)
+        # May find a real .env in parent dirs; just check it doesn't crash
+        assert result is None or result.name == ".env"
+
+    def test_continues_past_oserror_on_intermediate_dir(self, tmp_path: Path) -> None:
+        """OSError on an intermediate .env candidate doesn't abort search."""
+        from deepagents_cli.config import _find_dotenv_from_start_path
+
+        # Create .env in the grandparent
+        env_file = tmp_path / ".env"
+        env_file.write_text("KEY=val")
+
+        child = tmp_path / "sub"
+        child.mkdir()
+
+        # Patch is_file to raise OSError for the child's .env candidate
+        original_is_file = Path.is_file
+
+        def patched_is_file(self: Path) -> bool:
+            if self == child / ".env":
+                msg = "Permission denied"
+                raise OSError(msg)
+            return original_is_file(self)
+
+        with patch.object(Path, "is_file", patched_is_file):
+            result = _find_dotenv_from_start_path(child)
+
+        # Should continue past the OSError and find .env in parent
+        assert result == env_file
