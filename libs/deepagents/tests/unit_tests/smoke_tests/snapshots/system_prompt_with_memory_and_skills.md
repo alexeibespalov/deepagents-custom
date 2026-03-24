@@ -50,47 +50,28 @@ Writing todos takes time and tokens, use it when it is helpful for managing comp
 
 
 
-## Skills System
+## Skills
 
-You have access to a skills library that provides specialized capabilities and domain knowledge.
+The following skills are available to you. Their full instructions are included below — follow them whenever the user's request matches a skill's domain.
 
 **User Skills**: `/skills/user/`
 **Project Skills**: `/skills/project/` (higher priority)
 
-**Available Skills:**
+### Skill: web-research
 
-- **web-research**: Structured approach to conducting thorough web research on any topic
-  -> Read `/skills/user/web-research/SKILL.md` for full instructions
-- **code-review**: Systematic code review process following best practices and style guides
-  -> Read `/skills/project/code-review/SKILL.md` for full instructions
+# Web Research Skill
 
-**How to Use Skills (Progressive Disclosure):**
+## When to Use
+- User asks you to research a topic
+- You need to gather information from the web
 
-Skills follow a **progressive disclosure** pattern - you see their name and description above, but only read full instructions when needed:
+### Skill: code-review
 
-1. **Recognize when a skill applies**: Check if the user's task matches a skill's description
-2. **Read the skill's full instructions**: Use the path shown in the skill list above
-3. **Follow the skill's instructions**: SKILL.md contains step-by-step workflows, best practices, and examples
-4. **Access supporting files**: Skills may include helper scripts, configs, or reference docs - use absolute paths
+# Code Review Skill
 
-**When to Use Skills:**
-- User's request matches a skill's domain (e.g., "research X" -> web-research skill)
-- You need specialized knowledge or structured workflows
-- A skill provides proven patterns for complex tasks
-
-**Executing Skill Scripts:**
-Skills may contain Python scripts or other executable files. Always use absolute paths from the skill list.
-
-**Example Workflow:**
-
-User: "Can you research the latest developments in quantum computing?"
-
-1. Check available skills -> See "web-research" skill with its path
-2. Read the skill using the path shown
-3. Follow the skill's research workflow (search -> organize -> synthesize)
-4. Use any helper scripts with absolute paths
-
-Remember: Skills make you more capable and consistent. When in doubt, check if a skill exists for the task!
+## When to Use
+- User asks you to review code
+- You need to provide feedback on a pull request
 
 
 

@@ -77,9 +77,9 @@ class TestToolsExceptionHandling:
         with patch("deepagents_cli.tools._get_tavily_client", return_value=mock_client):
             result = web_search("test query")
 
-        assert "error" in result
-        assert "Rate limit" in result["error"]
-        assert result["query"] == "test query"
+        assert isinstance(result, str)
+        assert "Web search error" in result
+        assert "Rate limit" in result
 
     def test_web_search_handles_tavily_invalid_api_key(self):
         """Test that web_search catches Tavily InvalidAPIKeyError."""
@@ -88,8 +88,9 @@ class TestToolsExceptionHandling:
         with patch("deepagents_cli.tools._get_tavily_client", return_value=mock_client):
             result = web_search("test query")
 
-        assert "error" in result
-        assert "Invalid key" in result["error"]
+        assert isinstance(result, str)
+        assert "Web search error" in result
+        assert "Invalid key" in result
 
     def test_web_search_handles_tavily_bad_request(self):
         """Test that web_search catches Tavily BadRequestError."""
@@ -98,8 +99,9 @@ class TestToolsExceptionHandling:
         with patch("deepagents_cli.tools._get_tavily_client", return_value=mock_client):
             result = web_search("test query")
 
-        assert "error" in result
-        assert "Bad request" in result["error"]
+        assert isinstance(result, str)
+        assert "Web search error" in result
+        assert "Bad request" in result
 
     def test_web_search_handles_tavily_timeout(self):
         """Test that web_search catches Tavily TimeoutError."""
@@ -108,8 +110,9 @@ class TestToolsExceptionHandling:
         with patch("deepagents_cli.tools._get_tavily_client", return_value=mock_client):
             result = web_search("test query")
 
-        assert "error" in result
-        assert "timed out" in result["error"].lower()
+        assert isinstance(result, str)
+        assert "Web search error" in result
+        assert "timed out" in result.lower()
 
 
 class TestFileOpsExceptionHandling:

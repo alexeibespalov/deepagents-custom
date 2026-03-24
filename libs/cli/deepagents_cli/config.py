@@ -765,11 +765,21 @@ class Settings:
     tavily_api_key: str | None
     """Tavily API key if available."""
 
+    google_cloud_project: str | None
+    """Google Cloud project ID for VertexAI authentication."""
+
+    deepagents_langchain_project: str | None
+    """LangSmith project name for deepagents agent tracing."""
+
+    user_langchain_project: str | None
+    """Original `LANGSMITH_PROJECT` from environment (for user code)."""
+
+    # Optional: OpenAI-compatible gateway / custom base URL
     openai_base_url: str | None = None
     """Custom base URL for OpenAI-compatible endpoints (e.g. local gateways).
     Read from OPENAI_BASE_URL or OPENAI_API_BASE env vars."""
 
-    # Azure OpenAI configuration
+    # Optional: Azure OpenAI configuration
     azure_openai_api_key: str | None = None
     """Azure OpenAI API key."""
 
@@ -782,7 +792,7 @@ class Settings:
     azure_openai_deployment: str | None = None
     """Azure OpenAI deployment/model name."""
 
-    # Local OpenAI-compatible providers
+    # Optional: Local OpenAI-compatible providers
     ollama_base_url: str | None = None
     """Ollama server base URL (e.g. http://localhost:11434)."""
 
@@ -794,15 +804,6 @@ class Settings:
 
     lmstudio_model: str | None = None
     """Default LM Studio model name."""
-
-    google_cloud_project: str | None
-    """Google Cloud project ID for VertexAI authentication."""
-
-    deepagents_langchain_project: str | None
-    """LangSmith project name for deepagents agent tracing."""
-
-    user_langchain_project: str | None
-    """Original `LANGSMITH_PROJECT` from environment (for user code)."""
 
     model_name: str | None = None
     """Currently active model name, set after model creation."""

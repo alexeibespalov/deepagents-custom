@@ -149,6 +149,7 @@ Instructions here.
         "metadata": {"author": "Test Author", "version": "1.0.0"},
         "allowed_tools": ["read_file", "write_file"],
         "path": "/skills/test-skill/SKILL.md",
+        "body": "# Test Skill\n\nInstructions here.",
     }
 
 
@@ -172,6 +173,7 @@ description: Minimal skill
         "metadata": {},
         "allowed_tools": [],
         "path": "/skills/minimal-skill/SKILL.md",
+        "body": "# Minimal Skill",
     }
 
 
@@ -541,6 +543,7 @@ def test_list_skills_from_backend_single_skill(tmp_path: Path) -> None:
             "license": None,
             "compatibility": None,
             "allowed_tools": [],
+            "body": "# My-Skill Skill\n\nInstructions go here.",
         }
     ]
 
@@ -630,6 +633,7 @@ def test_list_skills_from_backend_missing_skill_md(tmp_path: Path) -> None:
             "license": None,
             "compatibility": None,
             "allowed_tools": [],
+            "body": "# Valid-Skill Skill\n\nInstructions go here.",
         }
     ]
 
@@ -670,6 +674,7 @@ Content
             "license": None,
             "compatibility": None,
             "allowed_tools": [],
+            "body": "# Valid-Skill Skill\n\nInstructions go here.",
         }
     ]
 
@@ -705,6 +710,7 @@ def test_list_skills_from_backend_with_helper_files(tmp_path: Path) -> None:
             "license": None,
             "compatibility": None,
             "allowed_tools": [],
+            "body": "# My-Skill Skill\n\nInstructions go here.",
         }
     ]
 
@@ -783,7 +789,6 @@ def test_format_skills_list_single_skill() -> None:
     result = middleware._format_skills_list(skills)
     assert "web-research" in result
     assert "Research topics on the web" in result
-    assert "/skills/user/web-research/SKILL.md" in result
 
 
 def test_format_skills_list_multiple_skills_multiple_registries() -> None:
@@ -920,7 +925,8 @@ def test_format_skills_list_no_optional_fields() -> None:
 
     result = middleware._format_skills_list(skills)
     # Description line should NOT have any parenthetical annotation
-    assert "- **plain-skill**: A plain skill\n" in result
+    assert "plain-skill" in result
+    assert "A plain skill" in result
     assert "License" not in result
     assert "Compatibility" not in result
     assert "(advisory)" not in result
@@ -1008,6 +1014,7 @@ def test_before_agent_skill_override(tmp_path: Path) -> None:
         "license": None,
         "compatibility": None,
         "allowed_tools": [],
+        "body": "# Shared-Skill Skill\n\nInstructions go here.",
     }
 
 
@@ -1079,7 +1086,7 @@ def test_agent_with_skills_middleware_system_prompt(tmp_path: Path) -> None:
     system_message = messages[0]
     assert system_message.type == "system", "First message should be system prompt"
     content = system_message.text
-    assert "Skills System" in content, "System prompt should contain 'Skills System' section"
+    assert "## Skills" in content, "System prompt should contain skills section"
     assert "test-skill" in content, "System prompt should mention the skill name"
 
 
@@ -1197,7 +1204,7 @@ async def test_agent_with_skills_middleware_async(tmp_path: Path) -> None:
     system_message = messages[0]
     assert system_message.type == "system", "First message should be system prompt"
     content = system_message.text
-    assert "Skills System" in content, "System prompt should contain 'Skills System' section"
+    assert "## Skills" in content, "System prompt should contain skills section"
     assert "async-skill" in content, "System prompt should mention the skill name"
 
 
@@ -1213,7 +1220,16 @@ def test_agent_with_skills_middleware_multiple_registries_override(tmp_path: Pat
     user_skill_path = str(user_dir / "shared-skill" / "SKILL.md")
 
     base_content = make_skill_content("shared-skill", "Base registry description")
-    user_content = make_skill_content("shared-skill", "User registry description - should win")
+    user_content = """\
+---
+name: shared-skill
+description: User registry description - should win
+---
+
+# User Override Instructions
+
+This is the user version that should win.
+"""
 
     responses = backend.upload_files(
         [
@@ -1268,9 +1284,9 @@ def test_agent_with_skills_middleware_multiple_registries_override(tmp_path: Pat
     system_message = messages[0]
     assert system_message.type == "system", "First message should be system prompt"
     content = system_message.text
-    assert "Skills System" in content, "System prompt should contain 'Skills System' section"
+    assert "## Skills" in content, "System prompt should contain skills section"
     assert "shared-skill" in content, "System prompt should mention the skill name"
-    assert "User registry description - should win" in content, "Should use user source description"
+    assert "User Override Instructions" in content, "Should use user source body"
     assert "Base registry description" not in content, "Should not contain base source description"
 
 
@@ -1430,6 +1446,7 @@ def test_create_deep_agent_with_skills_default_backend() -> None:
             "metadata": {},
             "name": "test-skill",
             "path": "/skills/user/test-skill/SKILL.md",
+            "body": "# Test-Skill Skill\n\nInstructions go here.",
         },
     ]
 

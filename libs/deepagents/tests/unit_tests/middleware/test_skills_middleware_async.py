@@ -59,6 +59,7 @@ async def test_alist_skills_from_backend_single_skill(tmp_path: Path) -> None:
             "license": None,
             "compatibility": None,
             "allowed_tools": [],
+            "body": "# My-Skill Skill\n\nInstructions go here.",
         }
     ]
 
@@ -148,6 +149,7 @@ async def test_alist_skills_from_backend_missing_skill_md(tmp_path: Path) -> Non
             "license": None,
             "compatibility": None,
             "allowed_tools": [],
+            "body": "# Valid-Skill Skill\n\nInstructions go here.",
         }
     ]
 
@@ -188,6 +190,7 @@ Content
             "license": None,
             "compatibility": None,
             "allowed_tools": [],
+            "body": "# Valid-Skill Skill\n\nInstructions go here.",
         }
     ]
 
@@ -274,6 +277,7 @@ async def test_abefore_agent_skill_override(tmp_path: Path) -> None:
         "license": None,
         "compatibility": None,
         "allowed_tools": [],
+        "body": "# Shared-Skill Skill\n\nInstructions go here.",
     }
 
 
@@ -402,5 +406,5 @@ async def test_agent_with_skills_middleware_empty_sources_async(tmp_path: Path) 
     system_message = first_call["messages"][0]
     content = system_message.text
 
-    assert "Skills System" in content
+    assert "## Skills" in content
     assert "No skills available" in content
