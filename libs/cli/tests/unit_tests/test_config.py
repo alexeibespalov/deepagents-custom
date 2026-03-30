@@ -1641,6 +1641,56 @@ class TestCreateModelEdgeCaseParsing:
         create_model("")
         mock_default.assert_called_once()
 
+    @patch("langchain.chat_models.init_chat_model")
+    def test_lmstudio_uses_openai_compatible_provider(
+        self, mock_init_chat_model: Mock
+    ) -> None:
+        """LM Studio specs are normalized to the OpenAI-compatible provider."""
+        mock_model = Mock()
+        mock_model.profile = None
+        mock_init_chat_model.return_value = mock_model
+
+        previous_base_url = settings.lmstudio_base_url
+        settings.lmstudio_base_url = "http://localhost:1234/v1"
+        try:
+            with patch.dict("os.environ", {}, clear=False):
+                result = create_model("lmstudio:huihui-qwen3.5-9b-abliterated")
+        finally:
+            settings.lmstudio_base_url = previous_base_url
+
+        mock_init_chat_model.assert_called_once_with(
+            "huihui-qwen3.5-9b-abliterated",
+            model_provider="openai",
+            base_url="http://localhost:1234/v1",
+            disable_streaming=True,
+            api_key="lm-studio",
+        )
+        assert result.provider == "lmstudio"
+        assert result.model_name == "huihui-qwen3.5-9b-abliterated"
+
+    @patch("langchain.chat_models.init_chat_model")
+    def test_lmstudio_base_url_defaults_to_v1(self, mock_init_chat_model: Mock) -> None:
+        """LM Studio host-only URLs are normalized to the `/v1` API root."""
+        mock_model = Mock()
+        mock_model.profile = None
+        mock_init_chat_model.return_value = mock_model
+
+        previous_base_url = settings.lmstudio_base_url
+        settings.lmstudio_base_url = "http://127.0.0.1:1234"
+        try:
+            with patch.dict("os.environ", {}, clear=False):
+                create_model("lmstudio:huihui-qwen3.5-9b-abliterated")
+        finally:
+            settings.lmstudio_base_url = previous_base_url
+
+        mock_init_chat_model.assert_called_once_with(
+            "huihui-qwen3.5-9b-abliterated",
+            model_provider="openai",
+            base_url="http://127.0.0.1:1234/v1",
+            disable_streaming=True,
+            api_key="lm-studio",
+        )
+
 
 class TestCreateModelViaInitImportError:
     """Tests for _create_model_via_init() ImportError handling."""

@@ -1,5 +1,6 @@
 """Tests for deepagents._models helpers."""
 
+import os
 from unittest.mock import MagicMock, patch
 
 from langchain_core.language_models import BaseChatModel
@@ -41,6 +42,45 @@ class TestResolveModel:
 
         mock.assert_called_once_with("anthropic:claude-sonnet-4-6")
         assert result is mock.return_value
+
+    def test_lmstudio_prefix_uses_openai_compatible_endpoint(self) -> None:
+        with (
+            patch("deepagents._models.init_chat_model") as mock,
+            patch.dict(
+                os.environ,
+                {"LMSTUDIO_BASE_URL": "http://localhost:1234/v1"},
+                clear=False,
+            ),
+        ):
+            mock.return_value = MagicMock(spec=BaseChatModel)
+            result = resolve_model("lmstudio:huihui-qwen3.5-9b-abliterated")
+
+        mock.assert_called_once_with(
+            "openai:huihui-qwen3.5-9b-abliterated",
+            base_url="http://localhost:1234/v1",
+            disable_streaming=True,
+            api_key="lm-studio",
+        )
+        assert result is mock.return_value
+
+    def test_lmstudio_base_url_defaults_to_v1(self) -> None:
+        with (
+            patch("deepagents._models.init_chat_model") as mock,
+            patch.dict(
+                os.environ,
+                {"LMSTUDIO_BASE_URL": "http://127.0.0.1:1234"},
+                clear=False,
+            ),
+        ):
+            mock.return_value = MagicMock(spec=BaseChatModel)
+            resolve_model("lmstudio:huihui-qwen3.5-9b-abliterated")
+
+        mock.assert_called_once_with(
+            "openai:huihui-qwen3.5-9b-abliterated",
+            base_url="http://127.0.0.1:1234/v1",
+            disable_streaming=True,
+            api_key="lm-studio",
+        )
 
 
 class TestGetModelIdentifier:

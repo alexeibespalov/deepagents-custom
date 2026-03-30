@@ -2,10 +2,26 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
+from urllib.parse import urlparse, urlunparse
 
 from langchain.chat_models import init_chat_model
 from langchain_core.language_models import BaseChatModel
+
+
+def _normalize_lmstudio_base_url(base_url: str | None) -> str | None:
+    """Normalize LM Studio URLs to the OpenAI-compatible `/v1` API root."""
+    if not base_url:
+        return None
+
+    stripped_url = base_url.rstrip("/")
+    parsed_url = urlparse(stripped_url)
+    if parsed_url.path in {"", "/"}:
+        return urlunparse(parsed_url._replace(path="/v1"))
+    if parsed_url.path == "/v1":
+        return stripped_url
+    return base_url
 
 
 def resolve_model(model: str | BaseChatModel) -> BaseChatModel:
@@ -26,6 +42,19 @@ def resolve_model(model: str | BaseChatModel) -> BaseChatModel:
         return model
     if model.startswith("openai:"):
         return init_chat_model(model, use_responses_api=True)
+    if model.startswith("lmstudio:"):
+        _, _, model_name = model.partition(":")
+        kwargs: dict[str, Any] = {
+            "base_url": _normalize_lmstudio_base_url(
+                os.environ.get("LMSTUDIO_BASE_URL")
+            ),
+            "disable_streaming": True,
+            "api_key": os.environ.get("LMSTUDIO_API_KEY")
+            or os.environ.get("OPENAI_API_KEY")
+            or "lm-studio",
+        }
+        filtered_kwargs = {key: value for key, value in kwargs.items() if value is not None}
+        return init_chat_model(f"openai:{model_name}", **filtered_kwargs)
     return init_chat_model(model)
 
 

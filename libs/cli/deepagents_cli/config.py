@@ -15,7 +15,7 @@ from enum import StrEnum
 from importlib.metadata import PackageNotFoundError, distribution
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urlparse, urlunparse
 
 from deepagents_cli._version import __version__
 
@@ -1867,6 +1867,20 @@ def _apply_openrouter_defaults(kwargs: dict[str, Any]) -> None:
     kwargs.setdefault("app_title", _OPENROUTER_APP_TITLE)
 
 
+def _normalize_lmstudio_base_url(base_url: str | None) -> str | None:
+    """Normalize LM Studio URLs to the OpenAI-compatible `/v1` API root."""
+    if not base_url:
+        return None
+
+    stripped_url = base_url.rstrip("/")
+    parsed_url = urlparse(stripped_url)
+    if parsed_url.path in {"", "/"}:
+        return urlunparse(parsed_url._replace(path="/v1"))
+    if parsed_url.path == "/v1":
+        return stripped_url
+    return base_url
+
+
 def _get_provider_kwargs(
     provider: str, *, model_name: str | None = None
 ) -> dict[str, Any]:
@@ -1922,6 +1936,11 @@ def _get_provider_kwargs(
         s = _get_settings()
         if s.lmstudio_base_url:
             result["base_url"] = s.lmstudio_base_url
+
+    if provider == "lmstudio" and "base_url" in result:
+        normalized_base_url = _normalize_lmstudio_base_url(result["base_url"])
+        if normalized_base_url is not None:
+            result["base_url"] = normalized_base_url
 
     return result
 
@@ -2011,10 +2030,26 @@ def _create_model_via_init(
 
     from deepagents_cli.model_config import ModelConfigError
 
+    init_provider = provider
+    init_kwargs = dict(kwargs)
+    if provider == "lmstudio":
+        init_provider = "openai"
+        init_kwargs.setdefault("disable_streaming", True)
+        init_kwargs.setdefault(
+            "api_key",
+            os.environ.get("LMSTUDIO_API_KEY")
+            or os.environ.get("OPENAI_API_KEY")
+            or "lm-studio",
+        )
+
     try:
-        if provider:
-            return init_chat_model(model_name, model_provider=provider, **kwargs)
-        return init_chat_model(model_name, **kwargs)
+        if init_provider:
+            return init_chat_model(
+                model_name,
+                model_provider=init_provider,
+                **init_kwargs,
+            )
+        return init_chat_model(model_name, **init_kwargs)
     except ImportError as e:
         import importlib.util
 
@@ -2025,7 +2060,7 @@ def _create_model_via_init(
             "google_vertexai": "langchain-google-vertexai",
             "nvidia": "langchain-nvidia-ai-endpoints",
         }
-        package = package_map.get(provider, f"langchain-{provider}")
+        package = package_map.get(init_provider, f"langchain-{init_provider}")
         # Convert pip package name to Python module name for import check.
         module_name = package.replace("-", "_")
         try:
